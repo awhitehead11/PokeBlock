@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0f0f13;
+  --gold: #f5c518;
+  --mint: #00e5a0;
+}
+
+body {
+  background-color: var(--bg);
+  color: #f4f4f5;
+  min-height: 100dvh;
+  -webkit-tap-highlight-color: transparent;
+}
