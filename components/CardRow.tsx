@@ -4,12 +4,20 @@ type CardRowProps = {
   card: DisplayCard;
   showRemove?: boolean;
   onRemoveClick?: () => void;
+  /** High-confidence scan, or a medium row after the user confirmed. */
+  showConfirmedBadge?: boolean;
 };
 
-export function CardRow({ card, showRemove, onRemoveClick }: CardRowProps) {
+export function CardRow({
+  card,
+  showRemove,
+  onRemoveClick,
+  showConfirmedBadge,
+}: CardRowProps) {
+  const goldRing = card.showGoldConfirmRing;
   return (
     <div
-      className={`relative flex items-center gap-3 rounded-xl bg-white/[0.04] px-3 py-3 ring-1 ring-white/[0.06] ${showRemove ? "pr-9" : ""}`}
+      className={`relative flex items-center gap-3 rounded-xl bg-white/[0.04] px-3 py-3 ${showRemove ? "pr-9" : ""} ${goldRing ? "ring-2 ring-[#F5C518]/85 ring-offset-2 ring-offset-[#0f0f13]" : "ring-1 ring-white/[0.06]"}`}
     >
       {showRemove && onRemoveClick && (
         <button
@@ -23,12 +31,24 @@ export function CardRow({ card, showRemove, onRemoveClick }: CardRowProps) {
       )}
       <CardThumb card={card} />
       <div className="min-w-0 flex-1">
-        <p className="truncate font-semibold text-white">{card.name}</p>
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="truncate font-semibold text-white">{card.name}</p>
+          {showConfirmedBadge ? (
+            <span className="shrink-0 rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-400 ring-1 ring-emerald-500/25">
+              ✓ Confirmed
+            </span>
+          ) : null}
+        </div>
         <p className="mt-0.5 truncate text-xs text-zinc-500">
           {card.set} · {card.rarity} · {card.hp} HP
         </p>
       </div>
       <div className="flex min-h-[2.75rem] min-w-[4.25rem] shrink-0 flex-col items-end justify-center gap-0.5">
+        {card.priceStatus === "deferred" && (
+          <span className="text-sm text-zinc-600" aria-hidden>
+            —
+          </span>
+        )}
         {card.priceStatus === "loading" && (
           <span
             className="pokescan-price-shimmer block h-4 w-[3.25rem] rounded-md"

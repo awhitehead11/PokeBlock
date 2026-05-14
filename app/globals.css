@@ -26,6 +26,232 @@
   animation: pokescan-shimmer 1.35s ease-in-out infinite;
 }
 
+@keyframes pokescan-battle-glow {
+  0%,
+  100% {
+    box-shadow:
+      0 0 16px rgba(220, 38, 38, 0.35),
+      0 0 32px rgba(220, 38, 38, 0.2);
+  }
+  50% {
+    box-shadow:
+      0 0 28px rgba(220, 38, 38, 0.75),
+      0 0 48px rgba(220, 38, 38, 0.35);
+  }
+}
+
+.pokescan-battle-go {
+  animation: pokescan-battle-glow 1.85s ease-in-out infinite;
+}
+
+@keyframes pokescan-lightning {
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(1) rotate(-8deg);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.12) rotate(8deg);
+  }
+}
+
+.pokescan-battle-lightning {
+  animation: pokescan-lightning 0.85s ease-in-out infinite;
+}
+
+@keyframes pokescan-battle-arena {
+  0%,
+  100% {
+    background: radial-gradient(
+      ellipse 120% 80% at 50% 20%,
+      rgba(59, 130, 246, 0.12) 0%,
+      #0f0f13 55%
+    );
+  }
+  50% {
+    background: radial-gradient(
+      ellipse 120% 80% at 50% 30%,
+      rgba(245, 197, 24, 0.1) 0%,
+      rgba(30, 40, 70, 0.35) 45%,
+      #0f0f13 70%
+    );
+  }
+}
+
+.pokescan-battle-arena-bg {
+  animation: pokescan-battle-arena 5s ease-in-out infinite;
+}
+
+@keyframes pokescan-score-circle-pop {
+  0% {
+    transform: scale(0);
+  }
+  70% {
+    transform: scale(1.2);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.pokescan-score-circle-pop {
+  animation: pokescan-score-circle-pop 0.2s ease both;
+}
+
+@keyframes pokescan-tickerPhraseIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.pokescan-ticker-phrase-in {
+  animation: pokescan-tickerPhraseIn 0.2s ease both;
+}
+
+@keyframes pokescan-lightning-spin {
+  from {
+    transform: rotate(0deg) scale(1);
+  }
+  to {
+    transform: rotate(360deg) scale(1.05);
+  }
+}
+
+.pokescan-lightning-spin {
+  animation: pokescan-lightning-spin 0.9s linear infinite;
+}
+
+@keyframes pokescan-trophy-bounce {
+  0%,
+  100% {
+    transform: translateY(0) scale(1);
+  }
+  40% {
+    transform: translateY(-12px) scale(1.08);
+  }
+  55% {
+    transform: translateY(0) scale(1);
+  }
+}
+
+.pokescan-trophy-bounce {
+  animation: pokescan-trophy-bounce 1.2s ease-in-out infinite;
+}
+
+@keyframes pokescan-battle-scan-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(220, 38, 38, 0.35),
+      0 0 12px rgba(220, 38, 38, 0.25);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgba(220, 38, 38, 0.2),
+      0 0 22px rgba(220, 38, 38, 0.55);
+  }
+}
+
+.pokescan-battle-scan-pulse {
+  animation: pokescan-battle-scan-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pokescan-battle-scan-pulse-blue {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(59, 130, 246, 0.35),
+      0 0 12px rgba(59, 130, 246, 0.25);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgba(59, 130, 246, 0.22),
+      0 0 22px rgba(59, 130, 246, 0.5);
+  }
+}
+
+.pokescan-battle-scan-pulse-blue {
+  animation: pokescan-battle-scan-pulse-blue 1.6s ease-in-out infinite;
+}
+
+@keyframes pokescan-battle-scan-pulse-gold {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(245, 197, 24, 0.35),
+      0 0 12px rgba(245, 197, 24, 0.22);
+  }
+  50% {
+    box-shadow:
+      0 0 0 4px rgba(245, 197, 24, 0.2),
+      0 0 22px rgba(245, 197, 24, 0.45);
+  }
+}
+
+.pokescan-battle-scan-pulse-gold {
+  animation: pokescan-battle-scan-pulse-gold 1.6s ease-in-out infinite;
+}
+
+@keyframes pokescan-title-glow-gold {
+  0%,
+  100% {
+    text-shadow:
+      0 0 12px rgba(245, 197, 24, 0.35),
+      0 0 28px rgba(245, 197, 24, 0.15);
+  }
+  50% {
+    text-shadow:
+      0 0 20px rgba(245, 197, 24, 0.55),
+      0 0 40px rgba(245, 197, 24, 0.25);
+  }
+}
+
+.pokescan-verdict-title-gold {
+  animation: pokescan-title-glow-gold 2s ease-in-out infinite;
+}
+
+@keyframes pokescan-title-glow-blue {
+  0%,
+  100% {
+    text-shadow:
+      0 0 12px rgba(59, 130, 246, 0.45),
+      0 0 28px rgba(59, 130, 246, 0.2);
+  }
+  50% {
+    text-shadow:
+      0 0 22px rgba(59, 130, 246, 0.65),
+      0 0 40px rgba(59, 130, 246, 0.32);
+  }
+}
+
+.pokescan-verdict-title-blue {
+  animation: pokescan-title-glow-blue 2s ease-in-out infinite;
+}
+
+@keyframes pokescan-title-glow-red {
+  0%,
+  100% {
+    text-shadow:
+      0 0 12px rgba(220, 38, 38, 0.35),
+      0 0 24px rgba(220, 38, 38, 0.15);
+  }
+  50% {
+    text-shadow:
+      0 0 22px rgba(220, 38, 38, 0.55),
+      0 0 36px rgba(220, 38, 38, 0.25);
+  }
+}
+
+.pokescan-verdict-title-red {
+  animation: pokescan-title-glow-red 2s ease-in-out infinite;
+}
+
 body {
   background-color: var(--bg);
   color: #f4f4f5;

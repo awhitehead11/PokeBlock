@@ -1,11 +1,12 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AddCardTile } from "@/components/AddCardTile";
-import { CardRow } from "@/components/CardRow";
+import { BattleScreen } from "@/components/BattleScreen";
 import { RemoveCardModal } from "@/components/RemoveCardModal";
+import { ScanResultCard } from "@/components/ScanResultCard";
 import {
-  createDisplayCard,
+  displayCardFromRecognition,
   gradeFromDiff,
   hasPriceLoading,
   sumPrices,
@@ -14,20 +15,30 @@ import {
   type DisplayCard,
 } from "@/lib/cards";
 import { hydrateCardPrices } from "@/lib/hydratePrices";
+import { normalizeScanResults } from "@/lib/recognition";
 import { prepareImageForScan } from "@/lib/scanImage";
-import { normalizeCard, type ScannedCard } from "@/lib/types";
+import type { ScannedCard } from "@/lib/types";
 
-type Screen = "scanner" | "results" | "trade";
+type MainTab = "cards" | "trade" | "battle";
+const MAX_YOUR_CARDS = 4;
+const MAX_THEIR_CARDS = 4;
 
 type ScanIntent =
   | "replace-your-results"
+  | "append-your-results"
   | "append-your-trade"
-  | "append-their-trade";
+  | "append-their-trade"
+  | "rescan-battle-slot";
 
 async function parseScanResponse(res: Response): Promise<{
   ok: boolean;
   status: number;
-  data: { cards?: unknown[]; error?: string; raw?: string };
+  data: {
+    cards?: unknown[];
+    recognitions?: unknown[];
+    error?: string;
+    raw?: string;
+  };
 }> {
   const text = await res.text();
   if (!text) {
@@ -43,6 +54,7 @@ async function parseScanResponse(res: Response): Promise<{
       status: res.status,
       data: JSON.parse(text) as {
         cards?: unknown[];
+        recognitions?: unknown[];
         error?: string;
         raw?: string;
       },
@@ -65,11 +77,14 @@ async function parseScanResponse(res: Response): Promise<{
 }
 
 export default function Home() {
-  const [screen, setScreen] = useState<Screen>("scanner");
+  const [mainTab, setMainTab] = useState<MainTab>("cards");
+  const [lowConfidenceOpen, setLowConfidenceOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [yourCards, setYourCards] = useState<DisplayCard[]>([]);
-  const [theirCards, setTheirCards] = useState<DisplayCard[]>([]);
+  const [mySide, setMySide] = useState<DisplayCard[]>([]);
+  const [theirSide, setTheirSide] = useState<DisplayCard[]>([]);
+  const [lowScanOverlay, setLowScanOverlay] = useState(false);
+  const [skippedOnLastScan, setSkippedOnLastScan] = useState(0);
 
   const [removeConfirm, setRemoveConfirm] = useState<{
     side: "yours" | "theirs";
@@ -79,19 +94,72 @@ export default function Home() {
 
   const scanInputRef = useRef<HTMLInputElement>(null);
   const scanIntentRef = useRef<ScanIntent>("replace-your-results");
+  const battleRescanRef = useRef<{
+    side: "yours" | "theirs";
+    index: number;
+  } | null>(null);
+  const lowAppendSideRef = useRef<"yours" | "theirs" | null>(null);
+
+  const [battleRescanSlot, setBattleRescanSlot] = useState<{
+    side: "yours" | "theirs";
+    index: number;
+  } | null>(null);
 
   const [appendLoadingSide, setAppendLoadingSide] = useState<
     "yours" | "theirs" | null
   >(null);
 
+  const mySideRef = useRef(mySide);
+  const theirSideRef = useRef(theirSide);
+  useEffect(() => {
+    mySideRef.current = mySide;
+  }, [mySide]);
+  useEffect(() => {
+    theirSideRef.current = theirSide;
+  }, [theirSide]);
+
   const runScan = useCallback(async (file: File) => {
     setError(null);
     setLoading(true);
     const intent = scanIntentRef.current;
-    if (intent === "append-your-trade") setAppendLoadingSide("yours");
-    else if (intent === "append-their-trade") setAppendLoadingSide("theirs");
-    else setAppendLoadingSide(null);
+    if (intent === "append-your-trade") lowAppendSideRef.current = "yours";
+    else if (intent === "append-their-trade") lowAppendSideRef.current = "theirs";
+    else if (intent === "rescan-battle-slot") {
+      lowAppendSideRef.current = battleRescanRef.current?.side ?? null;
+    } else lowAppendSideRef.current = null;
+    if (intent === "append-your-trade" || intent === "append-your-results") {
+      setAppendLoadingSide("yours");
+    } else if (intent === "append-their-trade") {
+      setAppendLoadingSide("theirs");
+    } else if (intent === "rescan-battle-slot") {
+      const s = battleRescanRef.current?.side;
+      if (s === "yours") setAppendLoadingSide("yours");
+      else if (s === "theirs") setAppendLoadingSide("theirs");
+      else setAppendLoadingSide(null);
+    } else {
+      setAppendLoadingSide(null);
+    }
     try {
+      if (
+        (intent === "append-your-results" ||
+          intent === "append-your-trade") &&
+        mySideRef.current.length >= MAX_YOUR_CARDS
+      ) {
+        setError(
+          `You can keep up to ${MAX_YOUR_CARDS} cards on your side. Remove one to add another.`,
+        );
+        return;
+      }
+      if (
+        intent === "append-their-trade" &&
+        theirSideRef.current.length >= MAX_THEIR_CARDS
+      ) {
+        setError(
+          `You can keep up to ${MAX_THEIR_CARDS} cards on their side. Remove one to add another.`,
+        );
+        return;
+      }
+
       const dataUrl = await prepareImageForScan(file);
       const res = await fetch("/api/scan", {
         method: "POST",
@@ -107,44 +175,115 @@ export default function Home() {
               : `Scan failed (${status})`),
         );
       }
-      const rawList = Array.isArray(data.cards) ? data.cards : [];
-      const normalized: ScannedCard[] = [];
-      for (const item of rawList) {
-        const c = normalizeCard(item);
-        if (c) normalized.push(c);
+      const rawPayload = data.recognitions ?? data.cards;
+      const recs = normalizeScanResults(rawPayload ?? []);
+      const lowCount = recs.filter((r) => r.confidence === "low").length;
+      setSkippedOnLastScan(lowCount);
+      const accepted = recs.filter((r) => r.confidence !== "low");
+
+      if (accepted.length === 0) {
+        if (intent === "replace-your-results") {
+          setLowConfidenceOpen(true);
+        } else if (intent === "append-your-results") {
+          setError(
+            "Could not read a card in that photo. Try again with one card in frame.",
+          );
+        } else {
+          setLowScanOverlay(true);
+        }
+        return;
       }
-      const display = normalized.map(createDisplayCard);
+
+      const onePerPhoto = accepted.slice(0, 1);
+      const display = onePerPhoto.map(displayCardFromRecognition);
+      const toPrice = display.filter((d) => d.priceStatus === "loading");
 
       if (intent === "replace-your-results") {
-        setYourCards(display);
-        hydrateCardPrices(display, setYourCards);
-        setScreen("results");
+        setMySide(display);
+        if (toPrice.length > 0) hydrateCardPrices(toPrice, setMySide);
+        setLowConfidenceOpen(false);
+        setMainTab("cards");
+      } else if (intent === "append-your-results") {
+        const row = display[0];
+        if (!row) {
+          throw new Error(
+            "No card detected. Put one card in frame and try again.",
+          );
+        }
+        setMySide((prev) => [...prev, row]);
+        if (row.priceStatus === "loading") {
+          hydrateCardPrices([row], setMySide);
+        }
       } else if (intent === "append-your-trade") {
-        const first = normalized[0];
-        if (!first) {
+        const row = display[0];
+        if (!row) {
           throw new Error(
             "No card detected. Center one card and try again.",
           );
         }
-        const one = createDisplayCard(first);
-        setYourCards((prev) => [...prev, one]);
-        hydrateCardPrices([one], setYourCards);
+        setMySide((prev) => [...prev, row]);
+        if (row.priceStatus === "loading") {
+          hydrateCardPrices([row], setMySide);
+        }
       } else if (intent === "append-their-trade") {
-        const first = normalized[0];
-        if (!first) {
+        const row = display[0];
+        if (!row) {
           throw new Error(
             "No card detected. Center one card and try again.",
           );
         }
-        const one = createDisplayCard(first);
-        setTheirCards((prev) => [...prev, one]);
-        hydrateCardPrices([one], setTheirCards);
+        setTheirSide((prev) => [...prev, row]);
+        if (row.priceStatus === "loading") {
+          hydrateCardPrices([row], setTheirSide);
+        }
+      } else if (intent === "rescan-battle-slot") {
+        const slot = battleRescanRef.current;
+        const row = display[0];
+        if (!slot) {
+          throw new Error("Missing rescan slot — try again.");
+        }
+        if (!row) {
+          setError(
+            "Could not read a card in that photo. Try again with one card in frame.",
+          );
+          return;
+        }
+        const patch = (prev: DisplayCard[]) =>
+          prev.map((c, i) =>
+            i === slot.index
+              ? ({
+                  ...row,
+                  displayId: c.displayId,
+                } as DisplayCard)
+              : c,
+          );
+        if (slot.side === "yours") {
+          setMySide((prev) => {
+            const next = patch(prev);
+            const m = next[slot.index];
+            if (m?.priceStatus === "loading") {
+              hydrateCardPrices([m], setMySide);
+            }
+            return next;
+          });
+        } else {
+          setTheirSide((prev) => {
+            const next = patch(prev);
+            const m = next[slot.index];
+            if (m?.priceStatus === "loading") {
+              hydrateCardPrices([m], setTheirSide);
+            }
+            return next;
+          });
+        }
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
       setLoading(false);
       setAppendLoadingSide(null);
+      battleRescanRef.current = null;
+      setBattleRescanSlot(null);
     }
   }, []);
 
@@ -158,22 +297,69 @@ export default function Home() {
     [runScan],
   );
 
-  const openYourScan = () => {
-    scanIntentRef.current = "replace-your-results";
+  const openYourScan = useCallback(() => {
+    setError(null);
+    if (mySideRef.current.length >= MAX_YOUR_CARDS) {
+      setError(
+        `You already have ${MAX_YOUR_CARDS} cards. Remove one to scan another.`,
+      );
+      return;
+    }
+    scanIntentRef.current =
+      mySideRef.current.length === 0
+        ? "replace-your-results"
+        : "append-your-results";
     scanInputRef.current?.click();
-  };
+  }, []);
+
+  const openAddYourFromResults = useCallback(() => {
+    setError(null);
+    if (mySideRef.current.length >= MAX_YOUR_CARDS) {
+      setError(
+        `You can keep up to ${MAX_YOUR_CARDS} cards. Remove one to add another.`,
+      );
+      return;
+    }
+    scanIntentRef.current = "append-your-results";
+    scanInputRef.current?.click();
+  }, []);
 
   const openAddYourToTrade = useCallback(() => {
     setError(null);
+    if (mySideRef.current.length >= MAX_YOUR_CARDS) {
+      setError(
+        `You can keep up to ${MAX_YOUR_CARDS} cards on your side. Remove one to add another.`,
+      );
+      return;
+    }
     scanIntentRef.current = "append-your-trade";
     scanInputRef.current?.click();
   }, []);
 
   const openAddTheirToTrade = useCallback(() => {
     setError(null);
+    if (theirSideRef.current.length >= MAX_THEIR_CARDS) {
+      setError(
+        `You can keep up to ${MAX_THEIR_CARDS} cards on their side. Remove one to add another.`,
+      );
+      return;
+    }
     scanIntentRef.current = "append-their-trade";
     scanInputRef.current?.click();
   }, []);
+
+  const openBattleRescan = useCallback(
+    (side: "yours" | "theirs", index: number) => {
+      setError(null);
+      battleRescanRef.current = { side, index };
+      setBattleRescanSlot({ side, index });
+      scanIntentRef.current = "rescan-battle-slot";
+      if (side === "yours") setAppendLoadingSide("yours");
+      else setAppendLoadingSide("theirs");
+      scanInputRef.current?.click();
+    },
+    [],
+  );
 
   const requestRemoveCard = (
     side: "yours" | "theirs",
@@ -189,22 +375,130 @@ export default function Home() {
     if (!removeConfirm) return;
     const { side, index } = removeConfirm;
     if (side === "yours") {
-      setYourCards((prev) => prev.filter((_, i) => i !== index));
+      setMySide((prev) => prev.filter((_, i) => i !== index));
     } else {
-      setTheirCards((prev) => prev.filter((_, i) => i !== index));
+      setTheirSide((prev) => prev.filter((_, i) => i !== index));
     }
     setRemoveConfirm(null);
   };
 
-  const yourTotal = sumPrices(yourCards);
-  const theirTotal = sumPrices(theirCards);
+  const confirmYourCardIdentity = useCallback(
+    (displayId: string, selected: ScannedCard) => {
+      const toHydrate: DisplayCard = {
+        ...selected,
+        displayId,
+        priceStatus: "loading",
+        recognitionConfidence: "medium",
+        pendingConfirmation: false,
+        alternates: [],
+        showGoldConfirmRing: true,
+      };
+      setMySide((prev) =>
+        prev.map((c) =>
+          c.displayId === displayId
+            ? {
+                ...c,
+                ...selected,
+                displayId: c.displayId,
+                priceStatus: "loading",
+                pendingConfirmation: false,
+                alternates: [],
+                showGoldConfirmRing: true,
+                recognitionConfidence: "medium",
+                imageUrl: undefined,
+                priceUsd: undefined,
+                trend: undefined,
+                trendPercent: undefined,
+                priceRange: undefined,
+              }
+            : c,
+        ),
+      );
+      hydrateCardPrices([toHydrate], setMySide);
+    },
+    [],
+  );
+
+  const confirmTheirCardIdentity = useCallback(
+    (displayId: string, selected: ScannedCard) => {
+      const toHydrate: DisplayCard = {
+        ...selected,
+        displayId,
+        priceStatus: "loading",
+        recognitionConfidence: "medium",
+        pendingConfirmation: false,
+        alternates: [],
+        showGoldConfirmRing: true,
+      };
+      setTheirSide((prev) =>
+        prev.map((c) =>
+          c.displayId === displayId
+            ? {
+                ...c,
+                ...selected,
+                displayId: c.displayId,
+                priceStatus: "loading",
+                pendingConfirmation: false,
+                alternates: [],
+                showGoldConfirmRing: true,
+                recognitionConfidence: "medium",
+                imageUrl: undefined,
+                priceUsd: undefined,
+                trend: undefined,
+                trendPercent: undefined,
+                priceRange: undefined,
+              }
+            : c,
+        ),
+      );
+      hydrateCardPrices([toHydrate], setTheirSide);
+    },
+    [],
+  );
+
+  const notListedResultsRescan = useCallback(() => {
+    setMySide([]);
+    setMainTab("cards");
+  }, []);
+
+  const notListedYourTradeRow = useCallback((displayId: string) => {
+    setMySide((prev) => prev.filter((c) => c.displayId !== displayId));
+    setError(null);
+    scanIntentRef.current = "append-your-trade";
+    scanInputRef.current?.click();
+  }, []);
+
+  const notListedTheirTradeRow = useCallback((displayId: string) => {
+    setTheirSide((prev) => prev.filter((c) => c.displayId !== displayId));
+    setError(null);
+    scanIntentRef.current = "append-their-trade";
+    scanInputRef.current?.click();
+  }, []);
+
+  const retryAppendAfterLow = useCallback(() => {
+    setLowScanOverlay(false);
+    setError(null);
+    if (lowAppendSideRef.current === "yours") {
+      scanIntentRef.current = "append-your-trade";
+      scanInputRef.current?.click();
+    } else if (lowAppendSideRef.current === "theirs") {
+      scanIntentRef.current = "append-their-trade";
+      scanInputRef.current?.click();
+    }
+  }, []);
+
+  const yourTotal = sumPrices(mySide);
+  const theirTotal = sumPrices(theirSide);
   const verdict = gradeFromDiff(yourTotal, theirTotal);
   const absDiff = Math.abs(verdict.diff);
   const summary = tradeSummary(verdict.favor, absDiff);
-  const trends = trendFlagLine(yourCards, theirCards);
+  const trends = trendFlagLine(mySide, theirSide);
+
+  const yourListAddLoading = loading && appendLoadingSide === "yours";
+  const theirListAddLoading = loading && appendLoadingSide === "theirs";
 
   return (
-    <div className="mx-auto flex min-h-dvh max-w-md flex-col px-4 pb-8 pt-[max(1rem,env(safe-area-inset-top))]">
+    <div className="mx-auto flex min-h-dvh max-w-md flex-col">
       <input
         ref={scanInputRef}
         type="file"
@@ -221,84 +515,255 @@ export default function Home() {
         onRemove={confirmRemoveCard}
       />
 
-      {screen === "scanner" && (
-        <ScannerView
-          loading={loading}
-          error={error}
-          onScan={openYourScan}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-28 pt-[max(1rem,env(safe-area-inset-top))]">
+        {lowConfidenceOpen ? (
+          <LowConfidenceView
+            onTryAgain={() => {
+              setSkippedOnLastScan(0);
+              setLowConfidenceOpen(false);
+            }}
+          />
+        ) : (
+          <>
+            {mainTab === "cards" &&
+              (mySide.length === 0 ? (
+                <ScannerView
+                  mySideCount={mySide.length}
+                  maxCards={MAX_YOUR_CARDS}
+                  loading={loading}
+                  error={error}
+                  onScan={openYourScan}
+                />
+              ) : (
+                <ResultsView
+                  cards={mySide}
+                  cardCount={mySide.length}
+                  maxCards={MAX_YOUR_CARDS}
+                  total={yourTotal}
+                  loading={loading}
+                  yourAddLoading={yourListAddLoading}
+                  error={error}
+                  skippedOnLastScan={skippedOnLastScan}
+                  onConfirmIdentity={confirmYourCardIdentity}
+                  onNotListed={notListedResultsRescan}
+                  onAddYourCard={openAddYourFromResults}
+                  onRequestRemoveCard={(index, name) =>
+                    requestRemoveCard("yours", index, name)
+                  }
+                  onScanAgain={openYourScan}
+                />
+              ))}
+
+            {mainTab === "trade" && (
+              <TradeView
+                mySide={mySide}
+                theirSide={theirSide}
+                maxYourCards={MAX_YOUR_CARDS}
+                maxTheirCards={MAX_THEIR_CARDS}
+                yourTotal={yourTotal}
+                theirTotal={theirTotal}
+                verdict={verdict}
+                absDiff={absDiff}
+                summary={summary}
+                trends={trends}
+                loading={loading}
+                yourAddLoading={yourListAddLoading}
+                theirAddLoading={theirListAddLoading}
+                error={error}
+                onAddYourCard={openAddYourToTrade}
+                onAddTheirCard={openAddTheirToTrade}
+                onRequestRemoveCard={requestRemoveCard}
+                onConfirmYour={confirmYourCardIdentity}
+                onConfirmTheir={confirmTheirCardIdentity}
+                onNotListedYour={notListedYourTradeRow}
+                onNotListedTheir={notListedTheirTradeRow}
+              />
+            )}
+
+            {mainTab === "battle" && (
+              <BattleScreen
+                mySide={mySide}
+                theirSide={theirSide}
+                maxMy={MAX_YOUR_CARDS}
+                maxTheir={MAX_THEIR_CARDS}
+                loading={loading}
+                myAddLoading={yourListAddLoading}
+                theirAddLoading={theirListAddLoading}
+                error={error}
+                onScanMy={openAddYourToTrade}
+                onScanTheir={openAddTheirToTrade}
+                onRequestRemove={requestRemoveCard}
+                battleRescanSlot={battleRescanSlot}
+                onRescanBattleSlot={openBattleRescan}
+                onGoToMyCards={() => {
+                  setError(null);
+                  setMainTab("cards");
+                }}
+              />
+            )}
+          </>
+        )}
+      </div>
+
+      {!lowConfidenceOpen && (
+        <BottomTabNav
+          active={mainTab}
+          onChange={(t) => {
+            setError(null);
+            setMainTab(t);
+          }}
         />
       )}
 
-      {screen === "results" && (
-        <ResultsView
-          cards={yourCards}
-          total={yourTotal}
-          loading={loading}
-          error={error}
-          onBack={() => {
-            setError(null);
-            setScreen("scanner");
-          }}
-          onScanAgain={openYourScan}
-          onTrade={() => {
-            setError(null);
-            setTheirCards([]);
-            setScreen("trade");
-          }}
-        />
-      )}
-
-      {screen === "trade" && (
-        <TradeView
-          yourCards={yourCards}
-          theirCards={theirCards}
-          yourTotal={yourTotal}
-          theirTotal={theirTotal}
-          verdict={verdict}
-          absDiff={absDiff}
-          summary={summary}
-          trends={trends}
-          loading={loading}
-          yourAddLoading={loading && appendLoadingSide === "yours"}
-          theirAddLoading={loading && appendLoadingSide === "theirs"}
-          error={error}
-          onBack={() => setScreen("results")}
-          onAddYourCard={openAddYourToTrade}
-          onAddTheirCard={openAddTheirToTrade}
-          onRequestRemoveCard={requestRemoveCard}
+      {lowScanOverlay && (
+        <LowConfidenceAppendOverlay
+          onTryAgain={retryAppendAfterLow}
+          onDismiss={() => setLowScanOverlay(false)}
         />
       )}
     </div>
   );
 }
 
-function ScannerView({
-  loading,
-  error,
-  onScan,
+function BottomTabNav({
+  active,
+  onChange,
 }: {
-  loading: boolean;
-  error: string | null;
-  onScan: () => void;
+  active: MainTab;
+  onChange: (t: MainTab) => void;
 }) {
+  const btn = (t: MainTab, label: string, activeClass: string) => (
+    <button
+      type="button"
+      onClick={() => onChange(t)}
+      className={`flex-1 py-3.5 text-center text-xs font-semibold tracking-wide transition ${
+        active === t ? activeClass : "text-zinc-500 hover:text-zinc-300"
+      }`}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <nav className="fixed bottom-0 left-0 right-0 z-30 border-t border-white/10 bg-[#0f0f13]/95 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1 backdrop-blur-md">
+      <div className="mx-auto flex max-w-md px-1">
+        {btn("cards", "My Cards", "text-[#F5C518]")}
+        {btn("trade", "Trade", "text-[#F5C518]")}
+        {btn("battle", "Battle", "text-[#DC2626]")}
+      </div>
+    </nav>
+  );
+}
+
+function LowConfidenceView({ onTryAgain }: { onTryAgain: () => void }) {
   return (
     <>
       <header className="mb-6 flex items-center justify-between">
         <span className="text-xl font-bold tracking-tight text-[#F5C518]">
-          PokéScan
+          PokeBlock
+        </span>
+      </header>
+      <div className="flex flex-1 flex-col px-1">
+        <h1 className="text-center text-xl font-semibold leading-snug text-white">
+          Couldn&apos;t read this card clearly
+        </h1>
+        <ul className="mx-auto mt-8 max-w-sm list-disc space-y-3 pl-5 text-sm leading-relaxed text-zinc-400">
+          <li>Photo one card at a time — fill the frame with that card</li>
+          <li>Make sure the card number (bottom right) is visible</li>
+          <li>Try better lighting — avoid glare</li>
+          <li>Hold the camera steady</li>
+        </ul>
+        <button
+          type="button"
+          onClick={onTryAgain}
+          className="mt-auto w-full rounded-full bg-[#F5C518] py-3.5 text-sm font-semibold text-[#0f0f13]"
+        >
+          Try again
+        </button>
+      </div>
+    </>
+  );
+}
+
+function LowConfidenceAppendOverlay({
+  onTryAgain,
+  onDismiss,
+}: {
+  onTryAgain: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-40 flex items-end justify-center bg-black/80 p-4 sm:items-center">
+      <div
+        role="dialog"
+        aria-modal="true"
+        className="w-full max-w-sm rounded-2xl bg-[#18181f] p-5 shadow-2xl ring-1 ring-white/10"
+      >
+        <h2 className="text-lg font-semibold text-white">
+          Couldn&apos;t read this card clearly
+        </h2>
+        <ul className="mt-4 list-disc space-y-2 pl-5 text-sm text-zinc-400">
+          <li>One card in the photo — avoid extra cards in frame</li>
+          <li>Make sure the card number (bottom right) is visible</li>
+          <li>Try better lighting — avoid glare</li>
+          <li>Hold the camera steady and fill the frame</li>
+        </ul>
+        <div className="mt-6 flex flex-col gap-2 sm:flex-row-reverse">
+          <button
+            type="button"
+            onClick={onTryAgain}
+            className="w-full rounded-full bg-[#F5C518] py-3 text-sm font-semibold text-[#0f0f13] sm:flex-1"
+          >
+            Try again
+          </button>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="w-full rounded-full bg-white/10 py-3 text-sm font-semibold text-white ring-1 ring-white/15 sm:flex-1"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScannerView({
+  mySideCount,
+  maxCards,
+  loading,
+  error,
+  onScan,
+}: {
+  mySideCount: number;
+  maxCards: number;
+  loading: boolean;
+  error: string | null;
+  onScan: () => void;
+}) {
+  const atCap = mySideCount >= maxCards;
+  return (
+    <>
+      <header className="mb-6 flex items-center justify-between">
+        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
+          PokeBlock
         </span>
       </header>
 
       <button
         type="button"
         onClick={onScan}
-        disabled={loading}
+        disabled={loading || atCap}
         className="flex flex-1 flex-col items-stretch rounded-2xl text-left disabled:opacity-60"
       >
         <div className="flex min-h-[min(52vh,420px)] flex-1 flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#F5C518]/70 bg-white/[0.03] px-6 py-10 ring-1 ring-[#F5C518]/15">
           <CameraGlyph className="mb-4 h-14 w-14 text-[#F5C518]/90" />
           <p className="text-center text-sm leading-relaxed text-zinc-400">
-            Place up to 4 cards · Tap to scan
+            One card in frame · tap to scan
+          </p>
+          <p className="mt-2 text-center text-xs text-zinc-600">
+            Photo one card at a time. You can keep up to {maxCards} cards.
           </p>
         </div>
       </button>
@@ -307,14 +772,18 @@ function ScannerView({
         <button
           type="button"
           onClick={onScan}
-          disabled={loading}
+          disabled={loading || atCap}
           className="w-full rounded-full bg-[#F5C518] py-3.5 text-center text-sm font-semibold text-[#0f0f13] shadow-[0_8px_30px_rgba(245,197,24,0.18)] transition active:scale-[0.99] disabled:pointer-events-none disabled:opacity-50"
         >
-          {loading ? "Reading your cards..." : "Scan Cards"}
+          {loading
+            ? "Reading your card..."
+            : atCap
+              ? `${maxCards} cards — remove one to scan`
+              : "Scan a card"}
         </button>
         {loading && (
           <p className="text-center text-sm text-zinc-500">
-            Reading your cards...
+            Reading your card...
           </p>
         )}
         {error && (
@@ -329,46 +798,84 @@ function ScannerView({
 
 function ResultsView({
   cards,
+  cardCount,
+  maxCards,
   total,
   loading,
+  yourAddLoading,
   error,
-  onBack,
+  skippedOnLastScan,
+  onConfirmIdentity,
+  onNotListed,
+  onAddYourCard,
+  onRequestRemoveCard,
   onScanAgain,
-  onTrade,
 }: {
   cards: DisplayCard[];
+  cardCount: number;
+  maxCards: number;
   total: number;
   loading: boolean;
+  yourAddLoading: boolean;
   error: string | null;
-  onBack: () => void;
+  skippedOnLastScan: number;
+  onConfirmIdentity: (displayId: string, selected: ScannedCard) => void;
+  onNotListed: () => void;
+  onAddYourCard: () => void;
+  onRequestRemoveCard: (index: number, name: string) => void;
   onScanAgain: () => void;
-  onTrade: () => void;
 }) {
+  const showAddTile = cardCount >= 1 && cardCount < maxCards;
+  const atCap = cardCount >= maxCards;
+
   return (
     <>
-      <header className="mb-5 flex items-center gap-3">
-        <button
-          type="button"
-          onClick={onBack}
-          className="rounded-full px-2 py-1 text-sm text-zinc-400 transition hover:text-white"
-        >
-          ← Back
-        </button>
+      <header className="mb-5 flex items-center justify-between">
+        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
+          PokeBlock
+        </span>
       </header>
 
-      <h1 className="mb-4 text-2xl font-semibold tracking-tight text-white">
+      <h1 className="mb-1 text-2xl font-semibold tracking-tight text-white">
         Your Cards
       </h1>
+      <p className="mb-4 text-xs text-zinc-500">
+        One card per photo · up to {maxCards} cards · use the bar below for
+        Trade or Battle — your list stays in sync everywhere.
+      </p>
 
-      <div className="flex flex-1 flex-col gap-3">
-        {cards.length === 0 && !loading && (
-          <p className="text-sm text-zinc-500">
-            No cards detected. Try a clearer photo with less glare.
-          </p>
-        )}
-        {cards.map((c) => (
-          <CardRow key={c.displayId} card={c} />
-        ))}
+      {skippedOnLastScan > 0 ? (
+        <p className="mb-3 text-xs text-zinc-500">
+          Couldn&apos;t read {skippedOnLastScan} card
+          {skippedOnLastScan === 1 ? "" : "s"} in that photo (too uncertain).
+        </p>
+      ) : null}
+
+      <div className="flex flex-1 items-start gap-3">
+        <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
+          {cards.length === 0 && !loading && (
+            <p className="text-sm text-zinc-500">
+              No card detected. Try one card in frame with less glare.
+            </p>
+          )}
+          {cards.map((c, i) => (
+            <ScanResultCard
+              key={c.displayId}
+              card={c}
+              showRemove
+              onRemoveClick={() => onRequestRemoveCard(i, c.name)}
+              onConfirmIdentity={onConfirmIdentity}
+              onNotListed={onNotListed}
+            />
+          ))}
+        </div>
+        {showAddTile ? (
+          <AddCardTile
+            onClick={onAddYourCard}
+            disabled={loading || atCap}
+            loading={yourAddLoading}
+          />
+        ) : null}
       </div>
 
       {error && (
@@ -379,7 +886,7 @@ function ResultsView({
 
       <div className="mt-auto pt-8">
         <p className="mb-3 text-center text-sm text-zinc-500">
-          {cards.length} card{cards.length === 1 ? "" : "s"} scanned ·{" "}
+          {cardCount} of {maxCards} card{cardCount === 1 ? "" : "s"} ·{" "}
           <span className="font-medium text-white">${total}</span>
           {hasPriceLoading(cards) ? (
             <span className="text-zinc-600"> · …</span>
@@ -387,18 +894,13 @@ function ResultsView({
         </p>
         <button
           type="button"
-          onClick={onTrade}
-          className="mb-2 w-full rounded-full bg-[#F5C518] py-3.5 text-center text-sm font-semibold text-[#0f0f13]"
-        >
-          ⇄ Propose a Trade
-        </button>
-        <button
-          type="button"
           onClick={onScanAgain}
-          disabled={loading}
-          className="w-full rounded-full py-2 text-center text-xs text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline disabled:opacity-50"
+          disabled={loading || atCap}
+          className="w-full rounded-full py-2 text-center text-xs text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline disabled:opacity-40"
         >
-          Scan again
+          {atCap
+            ? `${maxCards} cards — remove one to scan again`
+            : "Scan another card"}
         </button>
       </div>
     </>
@@ -406,8 +908,10 @@ function ResultsView({
 }
 
 function TradeView({
-  yourCards,
-  theirCards,
+  mySide,
+  theirSide,
+  maxYourCards,
+  maxTheirCards,
   yourTotal,
   theirTotal,
   verdict,
@@ -418,13 +922,18 @@ function TradeView({
   yourAddLoading,
   theirAddLoading,
   error,
-  onBack,
   onAddYourCard,
   onAddTheirCard,
   onRequestRemoveCard,
+  onConfirmYour,
+  onConfirmTheir,
+  onNotListedYour,
+  onNotListedTheir,
 }: {
-  yourCards: DisplayCard[];
-  theirCards: DisplayCard[];
+  mySide: DisplayCard[];
+  theirSide: DisplayCard[];
+  maxYourCards: number;
+  maxTheirCards: number;
   yourTotal: number;
   theirTotal: number;
   verdict: ReturnType<typeof gradeFromDiff>;
@@ -435,7 +944,6 @@ function TradeView({
   yourAddLoading: boolean;
   theirAddLoading: boolean;
   error: string | null;
-  onBack: () => void;
   onAddYourCard: () => void;
   onAddTheirCard: () => void;
   onRequestRemoveCard: (
@@ -443,6 +951,10 @@ function TradeView({
     index: number,
     name: string,
   ) => void;
+  onConfirmYour: (displayId: string, selected: ScannedCard) => void;
+  onConfirmTheir: (displayId: string, selected: ScannedCard) => void;
+  onNotListedYour: (displayId: string) => void;
+  onNotListedTheir: (displayId: string) => void;
 }) {
   const diffLabel =
     verdict.favor === "even"
@@ -453,77 +965,85 @@ function TradeView({
 
   return (
     <>
-      <header className="mb-5 flex items-center gap-3">
-        <button
-          type="button"
-          onClick={onBack}
-          className="rounded-full px-2 py-1 text-sm text-zinc-400 transition hover:text-white"
-        >
-          ← Back
-        </button>
+      <header className="mb-5 flex items-center justify-between">
+        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
+          PokeBlock
+        </span>
+        <span className="text-sm font-semibold text-zinc-400">Trade</span>
       </header>
 
       <section className="mb-8">
-        <h2 className="mb-3 text-lg font-semibold text-white">Your Cards</h2>
+        <h2 className="mb-1 text-lg font-semibold text-white">Your Cards</h2>
+        <p className="mb-3 text-xs text-zinc-600">
+          One card per photo · up to {maxYourCards} cards · same list as on the
+          home results screen and in Battle Mode.
+        </p>
         <div className="flex items-start gap-3">
           <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
-            {yourCards.length === 0 && !yourAddLoading && (
+            {mySide.length === 0 && !yourAddLoading && (
               <p className="text-xs text-zinc-600">
-                Add cards one at a time with the camera.
+                Add your cards one at a time (max {maxYourCards}).
               </p>
             )}
-            {yourCards.map((c, i) => (
-              <CardRow
+            {mySide.map((c, i) => (
+              <ScanResultCard
                 key={c.displayId}
                 card={c}
                 showRemove
                 onRemoveClick={() =>
                   onRequestRemoveCard("yours", i, c.name)
                 }
+                onConfirmIdentity={onConfirmYour}
+                onNotListed={() => onNotListedYour(c.displayId)}
               />
             ))}
           </div>
           <AddCardTile
             onClick={onAddYourCard}
-            disabled={loading}
+            disabled={loading || mySide.length >= maxYourCards}
             loading={yourAddLoading}
           />
         </div>
         <p className="mt-2 text-right text-xs text-zinc-500">
-          Subtotal · ${yourTotal}
-          {hasPriceLoading(yourCards) ? " · …" : ""}
+          {mySide.length} of {maxYourCards} · Subtotal · ${yourTotal}
+          {hasPriceLoading(mySide) ? " · …" : ""}
         </p>
       </section>
 
       <section className="mb-6">
-        <h2 className="mb-3 text-lg font-semibold text-white">Their Cards</h2>
+        <h2 className="mb-1 text-lg font-semibold text-white">Their Cards</h2>
+        <p className="mb-3 text-xs text-zinc-600">
+          One card per photo · up to {maxTheirCards} cards on their side.
+        </p>
         <div className="flex items-start gap-3">
           <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
-            {theirCards.length === 0 && !theirAddLoading && (
+            {theirSide.length === 0 && !theirAddLoading && (
               <p className="text-xs text-zinc-600">
-                Scan their cards one at a time.
+                Scan their cards one at a time (max {maxTheirCards}).
               </p>
             )}
-            {theirCards.map((c, i) => (
-              <CardRow
+            {theirSide.map((c, i) => (
+              <ScanResultCard
                 key={c.displayId}
                 card={c}
                 showRemove
                 onRemoveClick={() =>
                   onRequestRemoveCard("theirs", i, c.name)
                 }
+                onConfirmIdentity={onConfirmTheir}
+                onNotListed={() => onNotListedTheir(c.displayId)}
               />
             ))}
           </div>
           <AddCardTile
             onClick={onAddTheirCard}
-            disabled={loading}
+            disabled={loading || theirSide.length >= maxTheirCards}
             loading={theirAddLoading}
           />
         </div>
         <p className="mt-2 text-right text-xs text-zinc-500">
-          Subtotal · ${theirTotal}
-          {hasPriceLoading(theirCards) ? " · …" : ""}
+          {theirSide.length} of {maxTheirCards} · Subtotal · ${theirTotal}
+          {hasPriceLoading(theirSide) ? " · …" : ""}
         </p>
       </section>
 

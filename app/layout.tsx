@@ -3,8 +3,12 @@ import { GeistSans } from "geist/font/sans";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "PokéScan",
+  title: "PokeBlock",
   description: "Mobile-first Pokémon card scanning",
+  icons: {
+    icon: "/favicon.ico",
+    apple: "/favicon.ico",
+  },
 };
 
 export const viewport: Viewport = {

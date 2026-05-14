@@ -1,12 +1,16 @@
+import type { RecognitionResult } from "@/lib/recognition";
 import type { ScannedCard } from "@/lib/types";
 import type { PriceApiResponse, PriceApiSuccess } from "@/lib/priceApi";
 import { isPriceError } from "@/lib/priceApi";
 
 export type PriceStatus =
+  | "deferred"
   | "loading"
   | "ok"
   | "not_found"
   | "pricing_unavailable";
+
+export type RecognitionConfidence = "high" | "medium";
 
 export type DisplayCard = ScannedCard & {
   displayId: string;
@@ -16,17 +20,93 @@ export type DisplayCard = ScannedCard & {
   trendPercent?: number;
   priceRange?: { low: number; mid: number; high: number };
   imageUrl?: string | null;
+  /** Vision confidence (low cards are never added to the list). */
+  recognitionConfidence: RecognitionConfidence;
+  /** Medium-confidence rows until the user picks a candidate. */
+  pendingConfirmation: boolean;
+  alternates: ScannedCard[];
+  /** After confirming a medium row, show a gold ring on the row. */
+  showGoldConfirmRing?: boolean;
 };
 
+/** True when the card cannot be used in battle (missing HP, attacks, type, or weakness data). */
+export function cardMissingBattleData(c: DisplayCard): boolean {
+  return !cardPassesBattleValidation(c);
+}
+
+/** Every field required for battle simulation must be present — no placeholders. */
+export function cardPassesBattleValidation(c: DisplayCard): boolean {
+  if (c.battleHp == null || typeof c.battleHp !== "number" || !Number.isFinite(c.battleHp)) {
+    return false;
+  }
+  if (c.battleHp <= 0) return false;
+  const type = typeof c.type === "string" ? c.type.trim() : "";
+  if (!type || type === "?") return false;
+  if (!c.attacks || !Array.isArray(c.attacks) || c.attacks.length === 0) {
+    return false;
+  }
+  const hasDamagingAttack = c.attacks.some(
+    (a) =>
+      a &&
+      typeof a.damage === "number" &&
+      Number.isFinite(a.damage) &&
+      a.damage > 0,
+  );
+  if (!hasDamagingAttack) return false;
+  const w = c.weakness != null ? String(c.weakness).trim() : "";
+  if (w) {
+    const wm = c.weaknessMultiplier;
+    if (
+      wm == null ||
+      typeof wm !== "number" ||
+      !Number.isFinite(wm) ||
+      wm <= 0
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function newDisplayId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `id-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
 export function createDisplayCard(card: ScannedCard): DisplayCard {
-  const displayId =
-    typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : `id-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   return {
     ...card,
-    displayId,
+    displayId: newDisplayId(),
     priceStatus: "loading",
+    recognitionConfidence: "high",
+    pendingConfirmation: false,
+    alternates: [],
+  };
+}
+
+/** Build a row from a recognition (caller skips `low`). */
+export function displayCardFromRecognition(
+  r: RecognitionResult,
+): DisplayCard {
+  const displayId = newDisplayId();
+  if (r.confidence === "high") {
+    return {
+      ...r.card,
+      displayId,
+      priceStatus: "loading",
+      recognitionConfidence: "high",
+      pendingConfirmation: false,
+      alternates: [],
+    };
+  }
+  return {
+    ...r.card,
+    displayId,
+    priceStatus: "deferred",
+    recognitionConfidence: "medium",
+    pendingConfirmation: true,
+    alternates: r.alternates,
   };
 }
 
