@@ -6,6 +6,26 @@
   --mint: #00e5a0;
 }
 
+@keyframes pokescan-shimmer {
+  0% {
+    background-position: 130% 0;
+  }
+  100% {
+    background-position: -30% 0;
+  }
+}
+
+.pokescan-price-shimmer {
+  background: linear-gradient(
+    105deg,
+    rgba(245, 197, 24, 0.08) 0%,
+    rgba(245, 197, 24, 0.38) 45%,
+    rgba(245, 197, 24, 0.08) 90%
+  );
+  background-size: 220% 100%;
+  animation: pokescan-shimmer 1.35s ease-in-out infinite;
+}
+
 body {
   background-color: var(--bg);
   color: #f4f4f5;

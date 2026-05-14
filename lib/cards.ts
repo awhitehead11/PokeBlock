@@ -1,31 +1,83 @@
 import type { ScannedCard } from "@/lib/types";
+import type { PriceApiResponse, PriceApiSuccess } from "@/lib/priceApi";
+import { isPriceError } from "@/lib/priceApi";
 
-/** Deterministic pseudo-price and trend for demo UI (stateless, no DB). */
-export function enrichCard(card: ScannedCard, salt: string): DisplayCard {
-  const seed = hashString(`${salt}|${card.name}|${card.set}|${card.number}`);
-  const base = 8 + (seed % 220);
-  const jitter = (seed >> 8) % 40;
-  const priceUsd = base + jitter;
-  const trendUp = ((seed >> 16) & 1) === 1;
-  return { ...card, priceUsd, trendUp };
-}
+export type PriceStatus =
+  | "loading"
+  | "ok"
+  | "not_found"
+  | "pricing_unavailable";
 
 export type DisplayCard = ScannedCard & {
-  priceUsd: number;
-  trendUp: boolean;
+  displayId: string;
+  priceStatus: PriceStatus;
+  priceUsd?: number;
+  trend?: "up" | "down" | "stable";
+  trendPercent?: number;
+  priceRange?: { low: number; mid: number; high: number };
+  imageUrl?: string | null;
 };
 
-function hashString(s: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+export function createDisplayCard(card: ScannedCard): DisplayCard {
+  const displayId =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `id-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  return {
+    ...card,
+    displayId,
+    priceStatus: "loading",
+  };
+}
+
+export function applyPriceApiToCard(
+  card: DisplayCard,
+  json: unknown,
+): DisplayCard {
+  if (!json || typeof json !== "object") {
+    return { ...card, priceStatus: "pricing_unavailable" };
   }
-  return h >>> 0;
+  const body = json as PriceApiResponse;
+  if (isPriceError(body)) {
+    return {
+      ...card,
+      priceStatus:
+        body.error === "not_found" ? "not_found" : "pricing_unavailable",
+      priceUsd: undefined,
+      trend: undefined,
+      trendPercent: undefined,
+      priceRange: undefined,
+    };
+  }
+  if (
+    typeof (body as { price?: unknown }).price !== "number" ||
+    typeof (body as { trend?: unknown }).trend !== "string"
+  ) {
+    return { ...card, priceStatus: "pricing_unavailable" };
+  }
+  const ok = body as PriceApiSuccess;
+  return {
+    ...card,
+    priceStatus: "ok",
+    priceUsd: ok.price,
+    trend: ok.trend,
+    trendPercent: ok.trendPercent,
+    priceRange: ok.priceRange,
+    imageUrl: ok.imageUrl ?? card.imageUrl ?? null,
+  };
 }
 
 export function sumPrices(cards: DisplayCard[]): number {
-  return cards.reduce((a, c) => a + c.priceUsd, 0);
+  return cards.reduce((a, c) => {
+    if (c.priceStatus === "ok" && typeof c.priceUsd === "number") {
+      return a + c.priceUsd;
+    }
+    return a;
+  }, 0);
+}
+
+export function hasPriceLoading(cards: DisplayCard[]): boolean {
+  return cards.some((c) => c.priceStatus === "loading");
 }
 
 export function gradeFromDiff(
@@ -70,15 +122,16 @@ export function trendFlagLine(
   yours: DisplayCard[],
   theirs: DisplayCard[],
 ): string {
-  const picks = [...yours, ...theirs].slice(0, 4);
-  if (picks.length === 0) return "Scan cards to see market-style trend hints.";
+  const picks = [...yours, ...theirs]
+    .filter((c) => c.priceStatus === "ok" && c.trend)
+    .slice(0, 4);
+  if (picks.length === 0) {
+    return "Pricing will appear here as lookups complete.";
+  }
   const parts = picks.map((c) => {
-    const verb = c.trendUp ? "trending ↑" : "trending ↓";
-    const mood =
-      hashString(c.name + c.set) % 3 === 0 ? "stable" : verb;
-    return mood === "stable"
-      ? `${c.name} stable`
-      : `${c.name} ${verb}`;
+    if (c.trend === "stable") return `${c.name} stable`;
+    if (c.trend === "up") return `${c.name} trending ↑`;
+    return `${c.name} trending ↓`;
   });
   return parts.join(" · ");
 }

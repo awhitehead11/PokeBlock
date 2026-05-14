@@ -1,29 +1,67 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
+import { AddCardTile } from "@/components/AddCardTile";
 import { CardRow } from "@/components/CardRow";
+import { RemoveCardModal } from "@/components/RemoveCardModal";
 import {
-  enrichCard,
+  createDisplayCard,
   gradeFromDiff,
+  hasPriceLoading,
   sumPrices,
   tradeSummary,
   trendFlagLine,
   type DisplayCard,
 } from "@/lib/cards";
+import { hydrateCardPrices } from "@/lib/hydratePrices";
+import { prepareImageForScan } from "@/lib/scanImage";
 import { normalizeCard, type ScannedCard } from "@/lib/types";
 
 type Screen = "scanner" | "results" | "trade";
 
-function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => {
-      if (typeof r.result === "string") resolve(r.result);
-      else reject(new Error("read failed"));
+type ScanIntent =
+  | "replace-your-results"
+  | "append-your-trade"
+  | "append-their-trade";
+
+async function parseScanResponse(res: Response): Promise<{
+  ok: boolean;
+  status: number;
+  data: { cards?: unknown[]; error?: string; raw?: string };
+}> {
+  const text = await res.text();
+  if (!text) {
+    return {
+      ok: res.ok,
+      status: res.status,
+      data: { error: res.ok ? undefined : `Empty response (${res.status})` },
     };
-    r.onerror = () => reject(r.error ?? new Error("read failed"));
-    r.readAsDataURL(file);
-  });
+  }
+  try {
+    return {
+      ok: res.ok,
+      status: res.status,
+      data: JSON.parse(text) as {
+        cards?: unknown[];
+        error?: string;
+        raw?: string;
+      },
+    };
+  } catch {
+    const snippet = text.replace(/\s+/g, " ").slice(0, 180);
+    return {
+      ok: false,
+      status: res.status,
+      data: {
+        error:
+          res.status === 413
+            ? "Image too large for this host. Try again or use a smaller photo."
+            : snippet
+              ? `Server returned non-JSON (${res.status}): ${snippet}`
+              : `Bad response (${res.status})`,
+      },
+    };
+  }
 }
 
 export default function Home() {
@@ -33,27 +71,41 @@ export default function Home() {
   const [yourCards, setYourCards] = useState<DisplayCard[]>([]);
   const [theirCards, setTheirCards] = useState<DisplayCard[]>([]);
 
+  const [removeConfirm, setRemoveConfirm] = useState<{
+    side: "yours" | "theirs";
+    index: number;
+    name: string;
+  } | null>(null);
+
   const scanInputRef = useRef<HTMLInputElement>(null);
-  const theirScanInputRef = useRef<HTMLInputElement>(null);
-  const scanTargetRef = useRef<"yours" | "theirs">("yours");
+  const scanIntentRef = useRef<ScanIntent>("replace-your-results");
+
+  const [appendLoadingSide, setAppendLoadingSide] = useState<
+    "yours" | "theirs" | null
+  >(null);
 
   const runScan = useCallback(async (file: File) => {
     setError(null);
     setLoading(true);
+    const intent = scanIntentRef.current;
+    if (intent === "append-your-trade") setAppendLoadingSide("yours");
+    else if (intent === "append-their-trade") setAppendLoadingSide("theirs");
+    else setAppendLoadingSide(null);
     try {
-      const dataUrl = await fileToDataUrl(file);
+      const dataUrl = await prepareImageForScan(file);
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ imageBase64: dataUrl }),
       });
-      const data = (await res.json()) as {
-        cards?: unknown[];
-        error?: string;
-        raw?: string;
-      };
-      if (!res.ok) {
-        throw new Error(data.error || "Scan failed");
+      const { ok, status, data } = await parseScanResponse(res);
+      if (!ok) {
+        throw new Error(
+          data.error ||
+            (status === 500
+              ? "Server error — check host logs and ANTHROPIC_API_KEY."
+              : `Scan failed (${status})`),
+        );
       }
       const rawList = Array.isArray(data.cards) ? data.cards : [];
       const normalized: ScannedCard[] = [];
@@ -61,20 +113,38 @@ export default function Home() {
         const c = normalizeCard(item);
         if (c) normalized.push(c);
       }
-      const salt =
-        scanTargetRef.current === "yours" ? "your-scan" : "their-scan";
-      const display = normalized.map((c) => enrichCard(c, salt));
+      const display = normalized.map(createDisplayCard);
 
-      if (scanTargetRef.current === "yours") {
+      if (intent === "replace-your-results") {
         setYourCards(display);
+        hydrateCardPrices(display, setYourCards);
         setScreen("results");
-      } else {
-        setTheirCards(display);
+      } else if (intent === "append-your-trade") {
+        const first = normalized[0];
+        if (!first) {
+          throw new Error(
+            "No card detected. Center one card and try again.",
+          );
+        }
+        const one = createDisplayCard(first);
+        setYourCards((prev) => [...prev, one]);
+        hydrateCardPrices([one], setYourCards);
+      } else if (intent === "append-their-trade") {
+        const first = normalized[0];
+        if (!first) {
+          throw new Error(
+            "No card detected. Center one card and try again.",
+          );
+        }
+        const one = createDisplayCard(first);
+        setTheirCards((prev) => [...prev, one]);
+        hydrateCardPrices([one], setTheirCards);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
       setLoading(false);
+      setAppendLoadingSide(null);
     }
   }, []);
 
@@ -89,13 +159,41 @@ export default function Home() {
   );
 
   const openYourScan = () => {
-    scanTargetRef.current = "yours";
+    scanIntentRef.current = "replace-your-results";
     scanInputRef.current?.click();
   };
 
-  const openTheirScan = () => {
-    scanTargetRef.current = "theirs";
-    theirScanInputRef.current?.click();
+  const openAddYourToTrade = useCallback(() => {
+    setError(null);
+    scanIntentRef.current = "append-your-trade";
+    scanInputRef.current?.click();
+  }, []);
+
+  const openAddTheirToTrade = useCallback(() => {
+    setError(null);
+    scanIntentRef.current = "append-their-trade";
+    scanInputRef.current?.click();
+  }, []);
+
+  const requestRemoveCard = (
+    side: "yours" | "theirs",
+    index: number,
+    name: string,
+  ) => {
+    setRemoveConfirm({ side, index, name });
+  };
+
+  const cancelRemoveCard = () => setRemoveConfirm(null);
+
+  const confirmRemoveCard = () => {
+    if (!removeConfirm) return;
+    const { side, index } = removeConfirm;
+    if (side === "yours") {
+      setYourCards((prev) => prev.filter((_, i) => i !== index));
+    } else {
+      setTheirCards((prev) => prev.filter((_, i) => i !== index));
+    }
+    setRemoveConfirm(null);
   };
 
   const yourTotal = sumPrices(yourCards);
@@ -115,13 +213,12 @@ export default function Home() {
         className="hidden"
         onChange={onPickFile}
       />
-      <input
-        ref={theirScanInputRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        className="hidden"
-        onChange={onPickFile}
+
+      <RemoveCardModal
+        open={removeConfirm !== null}
+        pokemonName={removeConfirm?.name ?? ""}
+        onKeep={cancelRemoveCard}
+        onRemove={confirmRemoveCard}
       />
 
       {screen === "scanner" && (
@@ -162,9 +259,13 @@ export default function Home() {
           summary={summary}
           trends={trends}
           loading={loading}
+          yourAddLoading={loading && appendLoadingSide === "yours"}
+          theirAddLoading={loading && appendLoadingSide === "theirs"}
           error={error}
           onBack={() => setScreen("results")}
-          onScanTheirs={openTheirScan}
+          onAddYourCard={openAddYourToTrade}
+          onAddTheirCard={openAddTheirToTrade}
+          onRequestRemoveCard={requestRemoveCard}
         />
       )}
     </div>
@@ -266,7 +367,7 @@ function ResultsView({
           </p>
         )}
         {cards.map((c) => (
-          <CardRow key={`${c.name}-${c.set}-${c.number}`} card={c} />
+          <CardRow key={c.displayId} card={c} />
         ))}
       </div>
 
@@ -280,6 +381,9 @@ function ResultsView({
         <p className="mb-3 text-center text-sm text-zinc-500">
           {cards.length} card{cards.length === 1 ? "" : "s"} scanned ·{" "}
           <span className="font-medium text-white">${total}</span>
+          {hasPriceLoading(cards) ? (
+            <span className="text-zinc-600"> · …</span>
+          ) : null}
         </p>
         <button
           type="button"
@@ -311,9 +415,13 @@ function TradeView({
   summary,
   trends,
   loading,
+  yourAddLoading,
+  theirAddLoading,
   error,
   onBack,
-  onScanTheirs,
+  onAddYourCard,
+  onAddTheirCard,
+  onRequestRemoveCard,
 }: {
   yourCards: DisplayCard[];
   theirCards: DisplayCard[];
@@ -324,9 +432,17 @@ function TradeView({
   summary: string;
   trends: string;
   loading: boolean;
+  yourAddLoading: boolean;
+  theirAddLoading: boolean;
   error: string | null;
   onBack: () => void;
-  onScanTheirs: () => void;
+  onAddYourCard: () => void;
+  onAddTheirCard: () => void;
+  onRequestRemoveCard: (
+    side: "yours" | "theirs",
+    index: number,
+    name: string,
+  ) => void;
 }) {
   const diffLabel =
     verdict.favor === "even"
@@ -349,40 +465,65 @@ function TradeView({
 
       <section className="mb-8">
         <h2 className="mb-3 text-lg font-semibold text-white">Your Cards</h2>
-        <div className="flex flex-col gap-3">
-          {yourCards.map((c) => (
-            <CardRow key={`y-${c.name}-${c.set}-${c.number}`} card={c} />
-          ))}
+        <div className="flex items-start gap-3">
+          <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
+            {yourCards.length === 0 && !yourAddLoading && (
+              <p className="text-xs text-zinc-600">
+                Add cards one at a time with the camera.
+              </p>
+            )}
+            {yourCards.map((c, i) => (
+              <CardRow
+                key={c.displayId}
+                card={c}
+                showRemove
+                onRemoveClick={() =>
+                  onRequestRemoveCard("yours", i, c.name)
+                }
+              />
+            ))}
+          </div>
+          <AddCardTile
+            onClick={onAddYourCard}
+            disabled={loading}
+            loading={yourAddLoading}
+          />
         </div>
         <p className="mt-2 text-right text-xs text-zinc-500">
           Subtotal · ${yourTotal}
+          {hasPriceLoading(yourCards) ? " · …" : ""}
         </p>
       </section>
 
       <section className="mb-6">
-        <div className="mb-3 flex items-center justify-between gap-2">
-          <h2 className="text-lg font-semibold text-white">Their Cards</h2>
-          <button
-            type="button"
-            onClick={onScanTheirs}
+        <h2 className="mb-3 text-lg font-semibold text-white">Their Cards</h2>
+        <div className="flex items-start gap-3">
+          <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
+            {theirCards.length === 0 && !theirAddLoading && (
+              <p className="text-xs text-zinc-600">
+                Scan their cards one at a time.
+              </p>
+            )}
+            {theirCards.map((c, i) => (
+              <CardRow
+                key={c.displayId}
+                card={c}
+                showRemove
+                onRemoveClick={() =>
+                  onRequestRemoveCard("theirs", i, c.name)
+                }
+              />
+            ))}
+          </div>
+          <AddCardTile
+            onClick={onAddTheirCard}
             disabled={loading}
-            className="shrink-0 rounded-full bg-white/10 px-3 py-1.5 text-xs font-medium text-[#F5C518] ring-1 ring-white/10 transition hover:bg-white/[0.14] disabled:opacity-50"
-          >
-            {loading ? "Scanning…" : "Scan their stack"}
-          </button>
-        </div>
-        {theirCards.length === 0 && !loading && (
-          <p className="mb-3 text-sm text-zinc-500">
-            Scan their cards to compare piles.
-          </p>
-        )}
-        <div className="flex flex-col gap-3">
-          {theirCards.map((c) => (
-            <CardRow key={`t-${c.name}-${c.set}-${c.number}`} card={c} />
-          ))}
+            loading={theirAddLoading}
+          />
         </div>
         <p className="mt-2 text-right text-xs text-zinc-500">
           Subtotal · ${theirTotal}
+          {hasPriceLoading(theirCards) ? " · …" : ""}
         </p>
       </section>
 

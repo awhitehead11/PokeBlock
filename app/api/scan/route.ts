@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 
+/** Set ANTHROPIC_API_KEY (and TCGAPI_KEY for /api/price) in Vercel → Environment Variables. */
 export const runtime = "nodejs";
+/** Vercel / similar: allow slow vision calls (plan max still applies on Hobby). */
+export const maxDuration = 60;
 
 const MODEL = "claude-sonnet-4-5";
 
