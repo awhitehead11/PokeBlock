@@ -3,7 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 
 export const runtime = "nodejs";
 
-const MODEL = "claude-sonnet-4-20250514";
+const MODEL = "claude-sonnet-4-5";
 
 type ScanBody = {
   imageBase64: string;
