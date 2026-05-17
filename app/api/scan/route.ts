@@ -62,29 +62,21 @@ CONFIDENCE:
 - "medium" if the number is visible but partially obscured OR the variant/printing is uncertain OR set is somewhat uncertain.
 - "low" if the collector number is not visible OR the card is hard to identify OR the photo is too blurry/glare-heavy.
 
-BATTLE STATS — MUST READ FROM THE PRINTED CARD (never guess; if not clearly visible, use null):
-These fields power a real battle simulator. Wrong or guessed numbers break the app. If you cannot read a value with certainty, return null for that field (or null for the entire "attacks" array if the attack section is unreadable).
+BATTLE STATS — for the battle simulator (photos are often casual phone shots, not studio scans):
+Read from the image when the text/symbols are clearly visible. If you cannot see it on the photo, return null — do NOT fill in from Pokémon encyclopedia, memory, or typical card databases.
 
-- "hp": integer printed after "HP" at the top-right of the card. Read the number from the card only. If not clearly readable, null.
-- "type": the Pokémon type from the colored symbol at the top-left (e.g. Fire, Water). If not clearly readable, null.
-- "attacks": array of attacks from the attack boxes in the middle of the card. Each attack MUST include:
-  - "name": exact printed attack name.
-  - "damage": integer from the right side of that attack row (the damage number). If the attack has no numeric damage (only effects), omit that attack or use null for the whole "attacks" array if you cannot read damage. Never guess damage.
-  - "energyCost": integer = count of energy symbols on that attack row.
-  If the attack section is not clearly readable, set "attacks": null (not an empty array).
-- "weakness": type text next to Weakness at the bottom (e.g. "Water"), or null if not readable / none.
-- "weaknessMultiplier": the printed multiplier next to Weakness (almost always 2). If weakness is readable but the multiplier is not, use null for BOTH "weakness" and "weaknessMultiplier" (do not invent 2).
-- "resistance": type next to Resistance, or null if none / not readable.
-- "retreatCost": integer count of colorless retreat symbols, or null if not readable.
+- "hp": integer after "HP" top-right when visible on the photo. If not clearly readable, null.
+- "type": prefer the energy symbol top-left when visible. Allowed values: Fire, Water, Grass, Lightning, Psychic, Fighting, Darkness, Metal, Dragon, Fairy, Colorless (also accept Electric as Lightning). If the symbol is unreadable but the Pokémon is identifiable, you may use its usual single TCG type — never return "?".
+- "attacks": each attack visible on the card with name, damage (integer on the row), energyCost (symbol count). If the attack block is unreadable, null for the whole array. Do not invent attack names or damage from memory.
+- "weakness": ONLY if the bottom weakness label is clearly legible in the photo. Otherwise null. Never infer weakness from the Pokémon's species or from what the card "should" have.
+- "weaknessMultiplier": only when weakness is clearly read; usually 2. If weakness is null, both weakness and weaknessMultiplier must be null.
+- "resistance": ONLY if the bottom resistance label is clearly legible; otherwise null. Never infer from species knowledge.
+- "retreatCost": count retreat symbols when the bottom strip is clearly visible; otherwise null.
 
-READING ORDER TIPS (still must-read — not guessed):
-- HP: top-right, always a number after "HP".
-- Type: colored symbol, top-left.
-- Attacks: middle of card; damage is printed on the right side of each attack row.
-- Weakness / Resistance / Retreat: bottom strip of the card.
+The battle app computes super-effective damage from attacker type vs defender type (type chart). Weakness/resistance lines are optional extras — null is better than a guess.
 
 INCOMPLETE CARD POLICY:
-- If hp, type, or attacks cannot be read with certainty, return null for those fields as above. The app will flag the scan as incomplete and ask the user to rescan. Never fabricate hp, damage, energy, or type to "fill in."
+- If hp, type, or attacks cannot be read with certainty, return null for those fields. The app may ask for a rescan. Never fabricate hp, damage, or attacks.
 
 ALTERNATES:
 - If confidence is NOT high, populate "alternates" with up to 2 other plausible same-name (or same-art) variants (different number and/or variant and/or set) you considered. Each alternate must use the same "card" object shape as above (use nulls when battle fields are not readable).

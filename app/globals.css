@@ -257,4 +257,44 @@ body {
   color: #f4f4f5;
   min-height: 100dvh;
   -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+/* Mobile-friendly tap targets and sticky chrome */
+.ps-touch {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ps-btn {
+  min-height: 2.75rem; /* 44px */
+}
+
+@keyframes pokescan-scan-progress-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+.pokescan-scan-progress-indeterminate {
+  animation: pokescan-scan-progress-indeterminate 1.35s ease-in-out infinite;
+}
+
+.ps-sticky-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(
+    to top,
+    #0f0f13 75%,
+    rgba(15, 15, 19, 0.92) 90%,
+    transparent
+  );
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  padding-top: 0.75rem;
+  backdrop-filter: blur(12px);
 }

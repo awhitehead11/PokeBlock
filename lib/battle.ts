@@ -1,6 +1,27 @@
 import type { DisplayCard } from "@/lib/cards";
 import { cardPassesBattleValidation } from "@/lib/cards";
-import type { ScannedAttack } from "@/lib/types";
+import type { ScannedAttack, StatusCondition } from "@/lib/types";
+
+/** Standard Pokémon TCG type chart — fallback when printed weakness is missing. */
+const STANDARD_WEAKNESSES: Record<string, string[]> = {
+  Fire: ["Grass", "Ice", "Bug", "Steel"],
+  Water: ["Fire", "Rock", "Ground"],
+  Grass: ["Water", "Rock", "Ground"],
+  Electric: ["Water", "Flying"],
+  Psychic: ["Fighting", "Poison"],
+  Fighting: ["Normal", "Ice", "Rock", "Dark", "Steel"],
+  Ice: ["Grass", "Ground", "Flying", "Dragon"],
+  Rock: ["Fire", "Ice", "Flying", "Bug"],
+  Ground: ["Fire", "Electric", "Poison", "Rock", "Steel"],
+  Flying: ["Grass", "Fighting", "Bug"],
+  Bug: ["Grass", "Psychic", "Dark"],
+  Ghost: ["Psychic", "Ghost"],
+  Dragon: ["Dragon"],
+  Dark: ["Psychic", "Ghost"],
+  Steel: ["Ice", "Rock", "Fairy"],
+  Fairy: ["Fighting", "Dragon", "Dark"],
+  Poison: ["Grass", "Fairy"],
+};
 
 export type BattleSide = "yours" | "theirs";
 
@@ -66,12 +87,107 @@ function normType(s: string): string {
   return s.trim().toLowerCase();
 }
 
+/**
+ * Maps Pokémon TCG printed / OCR type labels to keys used by STANDARD_WEAKNESSES.
+ * Cards print Lightning, Darkness, Metal, Colorless; the chart uses Electric, Dark, Steel, Normal.
+ */
+const TCG_TYPE_CHART_ALIASES: Record<string, string> = {
+  Lightning: "Electric",
+  Electric: "Electric",
+  Darkness: "Dark",
+  Dark: "Dark",
+  Metal: "Steel",
+  Steel: "Steel",
+  Colorless: "Normal",
+  Normal: "Normal",
+};
+
+const TYPE_NORMALIZATION_HINT =
+  "Lightning→Electric, Darkness→Dark, Metal→Steel, Colorless→Normal";
+
+function canonicalTcgType(type: string): string {
+  const t = type.trim();
+  if (!t || t === "?") return "";
+  return t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+}
+
+/** Normalize scanned/printed type labels to chart keys (e.g. Lightning → Electric). */
+function chartTypeKey(type: string): string {
+  const c = canonicalTcgType(type);
+  return TCG_TYPE_CHART_ALIASES[c] ?? c;
+}
+
+function isRecognizedTcgType(type: string): boolean {
+  const key = chartTypeKey(type);
+  if (!key) return false;
+  if (key in STANDARD_WEAKNESSES || key === "Normal") return true;
+  return Object.values(STANDARD_WEAKNESSES).some((targets) =>
+    targets.includes(key),
+  );
+}
+
+/** Ignore OCR garbage on weakness/resistance so the standard chart fallback can apply. */
+function getEffectivePrintedType(field: string | null): string | null {
+  if (!field?.trim()) return null;
+  const trimmed = field.trim();
+  return isRecognizedTcgType(trimmed) ? trimmed : null;
+}
+
 function typesMatch(attackerType: string, defenderField: string | null): boolean {
-  if (!defenderField) return false;
-  const a = normType(attackerType);
-  const b = normType(defenderField);
+  if (!defenderField?.trim()) return false;
+  const a = normType(chartTypeKey(attackerType));
+  const b = normType(chartTypeKey(defenderField));
   if (!a || a === "?" || !b) return false;
   return a === b;
+}
+
+function resolveResistanceReduction(
+  attacker: Pick<InteractiveFighter, "type">,
+  defender: Pick<InteractiveFighter, "resistance">,
+): { isResistance: boolean; reduction: number } {
+  const printedRes = getEffectivePrintedType(defender.resistance);
+  if (printedRes && typesMatch(attacker.type, printedRes)) {
+    return { isResistance: true, reduction: 30 };
+  }
+  return { isResistance: false, reduction: 0 };
+}
+
+function weaknessFromTypeChart(
+  attacker: Pick<InteractiveFighter, "type">,
+  defender: Pick<InteractiveFighter, "type">,
+): { isWeakness: boolean; weaknessMultiplier: number } {
+  const attackerType = chartTypeKey(attacker.type);
+  const defenderType = chartTypeKey(defender.type);
+  if (
+    attackerType &&
+    defenderType &&
+    (STANDARD_WEAKNESSES[attackerType] ?? []).includes(defenderType)
+  ) {
+    return { isWeakness: true, weaknessMultiplier: 2 };
+  }
+  return { isWeakness: false, weaknessMultiplier: 1 };
+}
+
+function describeWeaknessResolution(
+  attacker: Pick<InteractiveFighter, "type">,
+  defender: Pick<
+    InteractiveFighter,
+    "type" | "weakness" | "weaknessMultiplier"
+  >,
+  result: { isWeakness: boolean },
+): string {
+  if (!result.isWeakness) {
+    return "No super-effective weakness this turn.";
+  }
+  const chart = weaknessFromTypeChart(attacker, defender);
+  if (chart.isWeakness) {
+    return `Type matchup chart (${chartTypeKey(attacker.type)} → ${chartTypeKey(defender.type)}).`;
+  }
+  const printed = getEffectivePrintedType(defender.weakness);
+  if (printed && typesMatch(attacker.type, printed)) {
+    return `Printed weakness line (${defender.weakness} → ${chartTypeKey(printed)}).`;
+  }
+  return "Weakness applied.";
 }
 
 function toFighter(card: DisplayCard): InternalFighter {
@@ -694,4 +810,614 @@ export function simulate(
     results,
     summary: buildSummary(results, mySide, theirSide),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERACTIVE TURN-BASED BATTLE
+// Bench rosters, status conditions, substitutions
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type BattleTeam = "blue" | "gold";
+
+export type InteractiveFighter = {
+  displayId: string;
+  name: string;
+  type: string;
+  maxHp: number;
+  currentHp: number;
+  attacks: ScannedAttack[];
+  weakness: string | null;
+  weaknessMultiplier: number | null;
+  resistance: string | null;
+  imageUrl?: string | null;
+  scannedPhotoDataUrl?: string | null;
+  isKnockedOut: boolean;
+  statusCondition: StatusCondition;
+};
+
+export type InteractiveBattleStatus =
+  | "active"
+  | "blue_wins"
+  | "gold_wins";
+
+export type TurnStatus =
+  | "coin_flip"
+  | "choosing"
+  | "status_blocked"
+  | "resolving"
+  | "animating"
+  | "choosing_replacement"
+  | "complete";
+
+export type TurnLogEntry = {
+  turn: number;
+  attackerTeam: BattleTeam;
+  attackerName: string;
+  defenderName: string;
+  attackUsed: string;
+  wasSubstitute: boolean;
+  substitutedInName?: string;
+  baseDamage: number;
+  finalDamage: number;
+  hpBefore: number;
+  hpAfter: number;
+  isWeakness: boolean;
+  isResistance: boolean;
+  wasKnockedOut: boolean;
+  statusApplied?: StatusCondition;
+  statusDamageTaken?: number;
+  confusionSelfHit?: boolean;
+  statusCured?: boolean;
+  narrative: string;
+  effectResolved?: string;
+  coinFlipResult?: "Heads" | "Tails" | null;
+};
+
+export type TeamState = {
+  activeIndex: number;
+  roster: InteractiveFighter[];
+};
+
+export type InteractiveBattleState = {
+  status: InteractiveBattleStatus;
+  turnStatus: TurnStatus;
+  turn: number;
+  activeTeam: BattleTeam;
+  teams: {
+    blue: TeamState;
+    gold: TeamState;
+  };
+  pendingKo: boolean;
+  log: TurnLogEntry[];
+  lastTurnResult: TurnLogEntry | null;
+};
+
+export type TurnResolution = {
+  attackerTeam: BattleTeam;
+  defenderTeam: BattleTeam;
+  attackerName: string;
+  defenderName: string;
+  attackUsed: string;
+  baseDamage: number;
+  finalDamage: number;
+  finalHp: number;
+  isWeakness: boolean;
+  isResistance: boolean;
+  statusApplied: StatusCondition | null;
+  confusionSelfHit: boolean;
+  selfDamage: number;
+  effectResolved: string;
+  coinFlipResult: "Heads" | "Tails" | null;
+  narrative: string;
+};
+
+function toInteractiveFighter(
+  card: DisplayCard,
+  scannedPhotoDataUrl?: string | null,
+): InteractiveFighter {
+  if (!cardPassesBattleValidation(card)) {
+    throw new Error(`[InteractiveBattle] Card not battle-ready: ${card.name}`);
+  }
+  const attacks = card.attacks!.filter(
+    (a) => typeof a.damage === "number" && a.damage > 0,
+  );
+  return {
+    displayId: card.displayId,
+    name: card.name,
+    type: card.type.trim(),
+    maxHp: card.battleHp!,
+    currentHp: card.battleHp!,
+    attacks,
+    weakness: card.weakness,
+    weaknessMultiplier: card.weaknessMultiplier,
+    resistance: card.resistance,
+    imageUrl: card.imageUrl ?? null,
+    scannedPhotoDataUrl: scannedPhotoDataUrl ?? null,
+    isKnockedOut: false,
+    statusCondition: "none",
+  };
+}
+
+export function createInteractiveBattle(
+  blueRoster: Array<[DisplayCard, string | null]>,
+  goldRoster: Array<[DisplayCard, string | null]>,
+): InteractiveBattleState {
+  if (blueRoster.length < 1 || blueRoster.length > 3) {
+    throw new Error("[InteractiveBattle] Blue roster must have 1–3 Pokémon");
+  }
+  if (goldRoster.length < 1 || goldRoster.length > 3) {
+    throw new Error("[InteractiveBattle] Gold roster must have 1–3 Pokémon");
+  }
+
+  return {
+    status: "active",
+    turnStatus: "coin_flip",
+    turn: 1,
+    activeTeam: "blue",
+    pendingKo: false,
+    teams: {
+      blue: {
+        activeIndex: 0,
+        roster: blueRoster.map(([card, photo]) =>
+          toInteractiveFighter(card, photo),
+        ),
+      },
+      gold: {
+        activeIndex: 0,
+        roster: goldRoster.map(([card, photo]) =>
+          toInteractiveFighter(card, photo),
+        ),
+      },
+    },
+    log: [],
+    lastTurnResult: null,
+  };
+}
+
+export function getActiveFighter(
+  state: InteractiveBattleState,
+  team: BattleTeam,
+): InteractiveFighter {
+  const t = state.teams[team];
+  return t.roster[t.activeIndex];
+}
+
+export function getBenchFighters(
+  state: InteractiveBattleState,
+  team: BattleTeam,
+): InteractiveFighter[] {
+  const t = state.teams[team];
+  return t.roster.filter(
+    (_, i) => i !== t.activeIndex && !t.roster[i].isKnockedOut,
+  );
+}
+
+export function getOpponentTeam(team: BattleTeam): BattleTeam {
+  return team === "blue" ? "gold" : "blue";
+}
+
+export function applyTurnResolution(
+  state: InteractiveBattleState,
+  resolution: TurnResolution,
+): InteractiveBattleState {
+  const next: InteractiveBattleState = JSON.parse(JSON.stringify(state));
+
+  const atkTeam = next.teams[resolution.attackerTeam];
+  const attacker = atkTeam.roster[atkTeam.activeIndex];
+  const defTeam = next.teams[resolution.defenderTeam];
+  const defender = defTeam.roster[defTeam.activeIndex];
+
+  const hpBefore = defender.currentHp;
+
+  if (resolution.confusionSelfHit && resolution.selfDamage > 0) {
+    attacker.currentHp = Math.max(0, attacker.currentHp - resolution.selfDamage);
+  } else {
+    defender.currentHp = Math.max(0, resolution.finalHp);
+  }
+
+  if (
+    resolution.statusApplied &&
+    resolution.statusApplied !== "none" &&
+    !resolution.confusionSelfHit
+  ) {
+    defender.statusCondition = resolution.statusApplied;
+  }
+
+  if (attacker.statusCondition === "paralyzed") {
+    attacker.statusCondition = "none";
+  }
+
+  let statusDamageTaken = 0;
+  if (attacker.statusCondition === "poisoned") {
+    statusDamageTaken = 10;
+    attacker.currentHp = Math.max(0, attacker.currentHp - 10);
+  } else if (attacker.statusCondition === "burned") {
+    statusDamageTaken = 20;
+    attacker.currentHp = Math.max(0, attacker.currentHp - 20);
+    const burnFlip = Math.random() < 0.5 ? "Heads" : "Tails";
+    if (burnFlip === "Heads") attacker.statusCondition = "none";
+  }
+
+  const defenderWasKnockedOut = defender.currentHp === 0;
+  const attackerWasKnockedOut = attacker.currentHp === 0;
+
+  if (defenderWasKnockedOut) defender.isKnockedOut = true;
+  if (attackerWasKnockedOut) attacker.isKnockedOut = true;
+
+  const engineWeakness = resolveWeaknessAndMultiplier(attacker, defender);
+  const engineResistance = resolveResistanceReduction(attacker, defender);
+
+  const entry: TurnLogEntry = {
+    turn: next.turn,
+    attackerTeam: resolution.attackerTeam,
+    attackerName: resolution.attackerName,
+    defenderName: resolution.defenderName,
+    attackUsed: resolution.attackUsed,
+    wasSubstitute: false,
+    baseDamage: resolution.baseDamage,
+    finalDamage: resolution.confusionSelfHit ? 0 : resolution.finalDamage,
+    hpBefore,
+    hpAfter: defender.currentHp,
+    isWeakness: engineWeakness.isWeakness,
+    isResistance: engineResistance.isResistance,
+    wasKnockedOut: defenderWasKnockedOut || attackerWasKnockedOut,
+    statusApplied: resolution.statusApplied ?? undefined,
+    statusDamageTaken: statusDamageTaken > 0 ? statusDamageTaken : undefined,
+    confusionSelfHit: resolution.confusionSelfHit || undefined,
+    narrative: resolution.narrative,
+    effectResolved: resolution.effectResolved,
+    coinFlipResult: resolution.coinFlipResult,
+  };
+
+  next.log.push(entry);
+  next.lastTurnResult = entry;
+
+  const checkKo = (koTeam: BattleTeam) => {
+    const team = next.teams[koTeam];
+    const remaining = team.roster.filter((f) => !f.isKnockedOut);
+    if (remaining.length === 0) {
+      next.status = koTeam === "blue" ? "gold_wins" : "blue_wins";
+      next.turnStatus = "complete";
+    } else {
+      next.pendingKo = true;
+      next.turnStatus = "choosing_replacement";
+      next.activeTeam = koTeam;
+    }
+  };
+
+  if (next.turnStatus !== "complete") {
+    if (defenderWasKnockedOut) checkKo(resolution.defenderTeam);
+    else if (attackerWasKnockedOut) checkKo(resolution.attackerTeam);
+    else next.turnStatus = "animating";
+  }
+
+  return next;
+}
+
+export function applySubstitute(
+  state: InteractiveBattleState,
+  incomingRosterIndex: number,
+): InteractiveBattleState {
+  const next: InteractiveBattleState = JSON.parse(JSON.stringify(state));
+  const team = next.teams[state.activeTeam];
+  const outgoing = team.roster[team.activeIndex];
+  const incoming = team.roster[incomingRosterIndex];
+
+  if (incoming.statusCondition === "confused") {
+    incoming.statusCondition = "none";
+  }
+
+  const entry: TurnLogEntry = {
+    turn: next.turn,
+    attackerTeam: state.activeTeam,
+    attackerName: outgoing.name,
+    defenderName: getActiveFighter(state, getOpponentTeam(state.activeTeam)).name,
+    attackUsed: "SUBSTITUTE",
+    wasSubstitute: true,
+    substitutedInName: incoming.name,
+    baseDamage: 0,
+    finalDamage: 0,
+    hpBefore: getActiveFighter(state, getOpponentTeam(state.activeTeam)).currentHp,
+    hpAfter: getActiveFighter(state, getOpponentTeam(state.activeTeam)).currentHp,
+    isWeakness: false,
+    isResistance: false,
+    wasKnockedOut: false,
+    narrative: `${outgoing.name} retreats to the bench. ${incoming.name} steps up! (Turn used)`,
+  };
+
+  team.activeIndex = incomingRosterIndex;
+  next.log.push(entry);
+  next.lastTurnResult = entry;
+
+  next.turn += 1;
+  next.activeTeam = getOpponentTeam(state.activeTeam);
+  next.turnStatus = "choosing";
+
+  return next;
+}
+
+export function applyChooseReplacement(
+  state: InteractiveBattleState,
+  incomingRosterIndex: number,
+): InteractiveBattleState {
+  const next: InteractiveBattleState = JSON.parse(JSON.stringify(state));
+  const team = next.teams[state.activeTeam];
+  team.activeIndex = incomingRosterIndex;
+  next.pendingKo = false;
+  next.turn += 1;
+  next.activeTeam = state.activeTeam;
+  next.turnStatus = "choosing";
+  return next;
+}
+
+export function applyStatusBlock(
+  state: InteractiveBattleState,
+): InteractiveBattleState {
+  const next: InteractiveBattleState = JSON.parse(JSON.stringify(state));
+  const fighter = getActiveFighter(next, state.activeTeam);
+  const opponent = getActiveFighter(state, getOpponentTeam(state.activeTeam));
+
+  let narrative = "";
+  let statusCured = false;
+  let coinFlipResult: "Heads" | "Tails" | null = null;
+
+  if (fighter.statusCondition === "paralyzed") {
+    narrative = `${fighter.name} is paralyzed and can't move!`;
+    fighter.statusCondition = "none";
+    statusCured = true;
+  } else if (fighter.statusCondition === "asleep") {
+    const flip = Math.random() < 0.5 ? "Heads" : "Tails";
+    coinFlipResult = flip;
+    if (flip === "Heads") {
+      fighter.statusCondition = "none";
+      narrative = `${fighter.name} woke up!`;
+      statusCured = true;
+    } else {
+      narrative = `${fighter.name} is fast asleep and can't move!`;
+    }
+  }
+
+  const entry: TurnLogEntry = {
+    turn: next.turn,
+    attackerTeam: state.activeTeam,
+    attackerName: fighter.name,
+    defenderName: opponent.name,
+    attackUsed: "STATUS_BLOCKED",
+    wasSubstitute: false,
+    baseDamage: 0,
+    finalDamage: 0,
+    hpBefore: opponent.currentHp,
+    hpAfter: opponent.currentHp,
+    isWeakness: false,
+    isResistance: false,
+    wasKnockedOut: false,
+    statusCured,
+    narrative,
+    coinFlipResult,
+  };
+
+  next.log.push(entry);
+  next.lastTurnResult = entry;
+  next.turn += 1;
+  next.activeTeam = getOpponentTeam(state.activeTeam);
+  next.turnStatus = "choosing";
+  return next;
+}
+
+export function advanceTurn(
+  state: InteractiveBattleState,
+): InteractiveBattleState {
+  const next: InteractiveBattleState = JSON.parse(JSON.stringify(state));
+  next.turn += 1;
+  next.activeTeam = getOpponentTeam(state.activeTeam);
+
+  const nextFighter = getActiveFighter(next, next.activeTeam);
+  if (
+    nextFighter.statusCondition === "paralyzed" ||
+    nextFighter.statusCondition === "asleep"
+  ) {
+    next.turnStatus = "status_blocked";
+  } else {
+    next.turnStatus = "choosing";
+  }
+
+  return next;
+}
+
+export const INTERACTIVE_BATTLE_SYSTEM_PROMPT = `
+You are the rules engine for a Pokémon Trading Card Game turn-based battle.
+Your only job is to resolve a single attack turn and return structured JSON.
+
+DAMAGE RULES:
+- Weakness and resistance are pre-calculated by the game engine in PRE-CALCULATED ESTIMATE. Trust those values.
+- TCG formula: finalDamage = (baseDamage × weaknessMultiplier) − resistanceReduction, floor 0.
+- Super-effective (×2) is determined from ATTACKER TYPE vs DEFENDER TYPE using the standard type chart — not from scanned "weakness" text (photos are often wrong or missing that line).
+- TYPE NORMALIZATION (label variants → chart key): ${TYPE_NORMALIZATION_HINT}
+- Examples: Lightning/Electric → Water is ×2; Fire → Grass is ×2; Water → Fire is ×2; Fighting → Dark is ×2.
+- Resistance still uses the scanned resistance field when present and recognizable.
+
+DAMAGE AUTHORITY RULE:
+When isWeakness is true, finalDamage MUST equal exactly (baseDamage × weaknessMultiplier)
+before resistance is subtracted. The pre-calculated estimate you receive is authoritative —
+you MUST NOT silently output a different number.
+
+The ONE exception: if the attack's own effect text explicitly states it modifies the base
+damage amount (e.g. "does 30 more damage", "damage is halved", "flip a coin, if tails
+this attack does nothing"), apply that modifier to baseDamage first, then apply weakness
+and resistance on top.
+
+If the effect text contains no explicit base-damage modifier, output finalDamage exactly
+as provided.
+
+WEAKNESS / RESISTANCE FLAGS (engine-owned):
+- Copy "Is weakness" and "Is resistance" from PRE-CALCULATED ESTIMATE exactly into isWeakness and isResistance.
+- Do NOT re-derive weakness from effect text, narrative, or the defender's scanned weakness line.
+- If Is weakness is true, mention super-effective damage in the narrative when appropriate.
+
+STATUS CONDITIONS — resolve these from attack effect text:
+- "poisoned": defender takes 10 damage at the end of each of their turns. Set statusApplied = "poisoned".
+- "burned": defender takes 20 damage at end of each turn; flip coin, heads = cured. Set statusApplied = "burned".
+- "paralyzed": defender cannot attack next turn (handled by game engine). Set statusApplied = "paralyzed".
+- "asleep": defender flips coin at start of their turn; tails = still asleep. Set statusApplied = "asleep".
+- "confused": before attacking, flip coin — heads = attack normally, tails = deal 30 damage to self instead.
+  If attacker is confused:
+  - Flip the coin NOW.
+  - If tails: set confusionSelfHit = true, selfDamage = 30, finalDamage = 0 (attack fails, hits self).
+  - If heads: attack proceeds normally, confusionSelfHit = false.
+
+ATTACK EFFECT TEXT:
+- Read the effect text carefully. Apply any damage bonuses, conditions, or coin flips it describes.
+- "Flip a coin. If heads, do X more damage" → flip coin, apply bonus if heads.
+- "This attack does X damage for each [condition]" → count the condition and multiply.
+- If effect text inflicts a status condition on the DEFENDER, set statusApplied to that condition.
+- If effect text inflicts a status on the ATTACKER (rare), note it in effectResolved but do not set statusApplied.
+- Only set ONE statusApplied per turn (the most significant one if multiple are possible).
+
+CURRENT ATTACKER STATUS (already applied by engine — you do NOT need to re-apply these):
+- Paralysis and sleep are handled before this prompt is called. If you see this prompt, the attacker CAN act.
+- Poison and burn end-of-turn damage is applied by the engine AFTER your response.
+- Confusion IS your responsibility — check the attacker's current status and resolve it.
+
+Return ONLY valid JSON. No markdown, no explanation outside the JSON.
+`.trim();
+
+function resolveWeaknessAndMultiplier(
+  attacker: Pick<InteractiveFighter, "type">,
+  defender: Pick<
+    InteractiveFighter,
+    "type" | "weakness" | "weaknessMultiplier"
+  >,
+): { isWeakness: boolean; weaknessMultiplier: number } {
+  // Primary: roster types + standard chart (photo scans rarely yield reliable weakness text).
+  const chart = weaknessFromTypeChart(attacker, defender);
+  if (chart.isWeakness) return chart;
+
+  // Secondary: printed weakness only when chart did not apply (e.g. special card text).
+  const printedWeakness = getEffectivePrintedType(defender.weakness);
+  if (printedWeakness && typesMatch(attacker.type, printedWeakness)) {
+    const mult = defender.weaknessMultiplier;
+    const effectiveMult =
+      mult != null && mult > 0 && Number.isFinite(mult) ? mult : 2;
+    return { isWeakness: true, weaknessMultiplier: effectiveMult };
+  }
+
+  return { isWeakness: false, weaknessMultiplier: 1 };
+}
+
+export function buildInteractiveTurnPrompt(
+  state: InteractiveBattleState,
+  chosenAttack: ScannedAttack,
+): string {
+  const attackerTeam = state.activeTeam;
+  const defenderTeam = getOpponentTeam(attackerTeam);
+  const attacker = getActiveFighter(state, attackerTeam);
+  const defender = getActiveFighter(state, defenderTeam);
+
+  const { isWeakness, weaknessMultiplier } = resolveWeaknessAndMultiplier(
+    attacker,
+    defender,
+  );
+  const { isResistance, reduction: resistanceReduction } =
+    resolveResistanceReduction(attacker, defender);
+  const weaknessNote = describeWeaknessResolution(attacker, defender, {
+    isWeakness,
+  });
+  const estimatedFinal = Math.max(
+    0,
+    Math.floor(chosenAttack.damage * weaknessMultiplier) - resistanceReduction,
+  );
+  const atkNorm = chartTypeKey(attacker.type) || attacker.type;
+  const defNorm = chartTypeKey(defender.type) || defender.type;
+
+  const attackerBench =
+    getBenchFighters(state, attackerTeam)
+      .map(
+        (f) =>
+          `  - ${f.name} (${f.currentHp}/${f.maxHp} HP, status: ${f.statusCondition})`,
+      )
+      .join("\n") || "  (none)";
+
+  const defenderBench =
+    getBenchFighters(state, defenderTeam)
+      .map(
+        (f) =>
+          `  - ${f.name} (${f.currentHp}/${f.maxHp} HP, status: ${f.statusCondition})`,
+      )
+      .join("\n") || "  (none)";
+
+  return `
+Resolve this Pokémon TCG battle turn and return a JSON object.
+
+=== TURN ${state.turn} ===
+Active team: ${attackerTeam.toUpperCase()}
+
+=== ATTACKER (${attackerTeam.toUpperCase()}) ===
+Name:             ${attacker.name}
+Type:             ${attacker.type}
+Current HP:       ${attacker.currentHp} / ${attacker.maxHp}
+Status condition: ${attacker.statusCondition}
+Attack used:      ${chosenAttack.name}
+Base damage:      ${chosenAttack.damage}
+Effect text:      "${chosenAttack.text ?? "No effect text"}"
+Bench:
+${attackerBench}
+
+=== DEFENDER (${defenderTeam.toUpperCase()}) ===
+Name:             ${defender.name}
+Type:             ${defender.type}
+Current HP:       ${defender.currentHp} / ${defender.maxHp}
+Weakness:         ${defender.weakness ?? "None"} (×${defender.weaknessMultiplier ?? "N/A"})
+Resistance:       ${defender.resistance ?? "None"} (−30)
+Status condition: ${defender.statusCondition}
+Bench:
+${defenderBench}
+
+=== TYPE NORMALIZATION (engine) ===
+${TYPE_NORMALIZATION_HINT}
+Attacker: ${attacker.type} → ${atkNorm}
+Defender: ${defender.type} → ${defNorm}
+Scanned weakness line (may be wrong — not used for ×2): ${defender.weakness ?? "none"}
+Scanned resistance line: ${defender.resistance ?? "none"}
+Weakness resolution: ${weaknessNote}
+
+=== PRE-CALCULATED ESTIMATE ===
+Is weakness: ${isWeakness}
+Weakness multiplier: ×${weaknessMultiplier}
+Is resistance: ${isResistance}
+Resistance reduction: −${resistanceReduction}
+Pre-calculated finalDamage: ${estimatedFinal}. This value is authoritative. Output this exact number unless the attack's effect text explicitly modifies base damage (e.g. "does X more damage", "damage is halved"). If no such modifier exists in the effect text, do not deviate.
+Estimated HP after: ${Math.max(0, defender.currentHp - estimatedFinal)}
+
+=== RESPONSE FORMAT (exact JSON, no markdown) ===
+{
+  "attackerTeam":    "${attackerTeam}",
+  "defenderTeam":    "${defenderTeam}",
+  "attackerName":    "${attacker.name}",
+  "defenderName":    "${defender.name}",
+  "attackUsed":      "${chosenAttack.name}",
+  "baseDamage":      <number>,
+  "finalDamage":     <number: damage dealt to DEFENDER after all modifiers; 0 if confusion self-hit>,
+  "finalHp":         <number: defender HP after finalDamage, floor 0>,
+  "isWeakness":      <boolean — copy "Is weakness" from PRE-CALCULATED ESTIMATE exactly>,
+  "isResistance":    <boolean — copy "Is resistance" from PRE-CALCULATED ESTIMATE exactly>,
+  "statusApplied":   <StatusCondition string or null: status inflicted on DEFENDER this turn>,
+  "confusionSelfHit":<boolean: true if attacker was confused and coin was tails>,
+  "selfDamage":      <number: damage to ATTACKER from confusion self-hit; 0 otherwise>,
+  "effectResolved":  <string: plain English description of how effect text was resolved>,
+  "coinFlipResult":  <"Heads" | "Tails" | null>,
+  "narrative":       <string: 1-2 dramatic sentences for the battle UI>
+}
+`.trim();
+}
+
+export function formatTurnLog(log: TurnLogEntry[]): string[] {
+  return log.map((e) => {
+    if (e.wasSubstitute) {
+      return `Turn ${e.turn} [${e.attackerTeam.toUpperCase()}]: ${e.attackerName} → ${e.substitutedInName ?? "?"} (sub)`;
+    }
+    if (e.attackUsed === "STATUS_BLOCKED") {
+      return `Turn ${e.turn} [${e.attackerTeam.toUpperCase()}]: ${e.narrative}`;
+    }
+    return `Turn ${e.turn} [${e.attackerTeam.toUpperCase()}]: ${e.attackerName} used ${e.attackUsed} → ${e.finalDamage} dmg${e.isWeakness ? " · Super Effective! ⚡💥" : ""}${e.isResistance ? " 🛡RESIST" : ""}${e.statusApplied && e.statusApplied !== "none" ? ` [${e.statusApplied}]` : ""} · ${e.defenderName} HP: ${e.hpAfter}${e.wasKnockedOut ? " 💀 KO!" : ""}`;
+  });
 }

@@ -1,7 +1,27 @@
+import type { DisplayCard } from "@/lib/cards";
+
+export type StatusCondition =
+  | "none"
+  | "poisoned"
+  | "burned"
+  | "paralyzed"
+  | "asleep"
+  | "confused";
+
+export type RosterEntry = {
+  card: DisplayCard;
+  scannedPhotoDataUrl: string | null;
+  record: {
+    wins: number;
+    losses: number;
+  };
+};
+
 export type ScannedAttack = {
   name: string;
   damage: number;
   energyCost: number;
+  text?: string;
 };
 
 export type ScannedCard = {

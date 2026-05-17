@@ -1,3 +1,5 @@
+import { ScanProgressBar } from "@/components/ScanProgressBar";
+
 type AddCardTileProps = {
   onClick: () => void;
   disabled?: boolean;
@@ -21,6 +23,11 @@ export function AddCardTile({
   const isGold = tone === "gold";
   const isBattleBlue = tone === "battle-blue";
   const isBattleGold = tone === "battle-gold";
+  const accentColor = isBattleBlue
+    ? "#3B82F6"
+    : isBattleGold || isGold
+      ? "#F5C518"
+      : "#F5C518";
   const pulseBlue = isBattleBlue && encouragePulse && !disabled && !loading;
   const pulseGold = isBattleGold && encouragePulse && !disabled && !loading;
 
@@ -58,9 +65,14 @@ export function AddCardTile({
       <span className={iconWrap} aria-hidden>
         +
       </span>
-      <span className={captionCls}>
-        {loading ? "Scanning…" : caption}
-      </span>
+      {loading ? (
+        <ScanProgressBar
+          accentColor={accentColor}
+          className="mt-1 w-full min-w-0 px-1"
+        />
+      ) : (
+        <span className={captionCls}>{caption}</span>
+      )}
     </button>
   );
 }

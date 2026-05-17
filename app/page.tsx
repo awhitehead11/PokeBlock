@@ -1,34 +1,67 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { AddCardTile } from "@/components/AddCardTile";
-import { BattleScreen } from "@/components/BattleScreen";
-import { RemoveCardModal } from "@/components/RemoveCardModal";
-import { ScanResultCard } from "@/components/ScanResultCard";
+import { useCallback, useRef, useState } from "react";
+import { InteractiveBattleScreen } from "@/components/InteractiveBattleScreen";
 import {
+  RosterReviewScreen,
+  type HpSnapshot,
+} from "@/components/RosterReviewScreen";
+import {
+  cardPassesBattleValidation,
   displayCardFromRecognition,
-  gradeFromDiff,
-  hasPriceLoading,
-  sumPrices,
-  tradeSummary,
-  trendFlagLine,
   type DisplayCard,
 } from "@/lib/cards";
-import { hydrateCardPrices } from "@/lib/hydratePrices";
+import type { BattleTeam, InteractiveBattleState } from "@/lib/battle";
 import { normalizeScanResults } from "@/lib/recognition";
 import { prepareImageForScan } from "@/lib/scanImage";
-import type { ScannedCard } from "@/lib/types";
+import type { RosterEntry, ScannedCard } from "@/lib/types";
+import {
+  ScanLoadingOverlay,
+  ScanProgressBar,
+} from "@/components/ScanProgressBar";
+import { scannedFieldsFromDisplayLike } from "@/lib/types";
 
-type MainTab = "cards" | "trade" | "battle";
-const MAX_YOUR_CARDS = 4;
-const MAX_THEIR_CARDS = 4;
+type TeamSetup = {
+  roster: RosterEntry[];
+};
 
-type ScanIntent =
-  | "replace-your-results"
-  | "append-your-results"
-  | "append-your-trade"
-  | "append-their-trade"
-  | "rescan-battle-slot";
+function updateRecordsAfterBattle(
+  blueRoster: RosterEntry[],
+  goldRoster: RosterEntry[],
+  winner: BattleTeam,
+): { blueRoster: RosterEntry[]; goldRoster: RosterEntry[] } {
+  const update = (roster: RosterEntry[], won: boolean): RosterEntry[] =>
+    roster.map((entry) => ({
+      ...entry,
+      record: {
+        wins: entry.record.wins + (won ? 1 : 0),
+        losses: entry.record.losses + (won ? 0 : 1),
+      },
+    }));
+
+  return {
+    blueRoster: update(blueRoster, winner === "blue"),
+    goldRoster: update(goldRoster, winner === "gold"),
+  };
+}
+
+function extractHpFromBattle(
+  state: InteractiveBattleState,
+): Record<string, HpSnapshot> {
+  const out: Record<string, HpSnapshot> = {};
+  for (const team of ["blue", "gold"] as const) {
+    for (const fighter of state.teams[team].roster) {
+      out[fighter.displayId] = {
+        displayId: fighter.displayId,
+        currentHp: fighter.currentHp,
+        maxHp: fighter.maxHp,
+      };
+    }
+  }
+  return out;
+}
+
+const MAX_SLOTS = 3;
 
 async function parseScanResponse(res: Response): Promise<{
   ok: boolean;
@@ -67,7 +100,7 @@ async function parseScanResponse(res: Response): Promise<{
       data: {
         error:
           res.status === 413
-            ? "Image too large for this host. Try again or use a smaller photo."
+            ? "Image too large. Try a smaller photo."
             : snippet
               ? `Server returned non-JSON (${res.status}): ${snippet}`
               : `Bad response (${res.status})`,
@@ -76,429 +109,223 @@ async function parseScanResponse(res: Response): Promise<{
   }
 }
 
-export default function Home() {
-  const [mainTab, setMainTab] = useState<MainTab>("cards");
-  const [lowConfidenceOpen, setLowConfidenceOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [mySide, setMySide] = useState<DisplayCard[]>([]);
-  const [theirSide, setTheirSide] = useState<DisplayCard[]>([]);
-  const [lowScanOverlay, setLowScanOverlay] = useState(false);
-  const [skippedOnLastScan, setSkippedOnLastScan] = useState(0);
+function teamIsReady(setup: TeamSetup): boolean {
+  if (setup.roster.length === 0) return false;
+  return setup.roster.every(
+    (e) =>
+      !e.card.pendingConfirmation && cardPassesBattleValidation(e.card),
+  );
+}
 
-  const [removeConfirm, setRemoveConfirm] = useState<{
-    side: "yours" | "theirs";
-    index: number;
-    name: string;
+export default function Home() {
+  const [blueSetup, setBlueSetup] = useState<TeamSetup>({ roster: [] });
+  const [goldSetup, setGoldSetup] = useState<TeamSetup>({ roster: [] });
+  const [inBattle, setInBattle] = useState(false);
+  const [battleKey, setBattleKey] = useState(0);
+  const [loadingSlot, setLoadingSlot] = useState<{
+    team: BattleTeam;
+    slot: number;
   } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [slotErrors, setSlotErrors] = useState<
+    Record<string, string>
+  >({});
+  const [lowScanOpen, setLowScanOpen] = useState(false);
+  const [showRosterReview, setShowRosterReview] = useState(false);
+  const [lastBattleHp, setLastBattleHp] = useState<Record<string, HpSnapshot>>(
+    {},
+  );
+  const [setupTab, setSetupTab] = useState<BattleTeam>("blue");
 
   const scanInputRef = useRef<HTMLInputElement>(null);
-  const scanIntentRef = useRef<ScanIntent>("replace-your-results");
-  const battleRescanRef = useRef<{
-    side: "yours" | "theirs";
-    index: number;
-  } | null>(null);
-  const lowAppendSideRef = useRef<"yours" | "theirs" | null>(null);
+  const scanTargetRef = useRef<{ team: BattleTeam; slot: number }>({
+    team: "blue",
+    slot: 0,
+  });
 
-  const [battleRescanSlot, setBattleRescanSlot] = useState<{
-    side: "yours" | "theirs";
-    index: number;
-  } | null>(null);
-
-  const [appendLoadingSide, setAppendLoadingSide] = useState<
-    "yours" | "theirs" | null
-  >(null);
-
-  const mySideRef = useRef(mySide);
-  const theirSideRef = useRef(theirSide);
-  useEffect(() => {
-    mySideRef.current = mySide;
-  }, [mySide]);
-  useEffect(() => {
-    theirSideRef.current = theirSide;
-  }, [theirSide]);
-
-  const runScan = useCallback(async (file: File) => {
-    setError(null);
-    setLoading(true);
-    const intent = scanIntentRef.current;
-    if (intent === "append-your-trade") lowAppendSideRef.current = "yours";
-    else if (intent === "append-their-trade") lowAppendSideRef.current = "theirs";
-    else if (intent === "rescan-battle-slot") {
-      lowAppendSideRef.current = battleRescanRef.current?.side ?? null;
-    } else lowAppendSideRef.current = null;
-    if (intent === "append-your-trade" || intent === "append-your-results") {
-      setAppendLoadingSide("yours");
-    } else if (intent === "append-their-trade") {
-      setAppendLoadingSide("theirs");
-    } else if (intent === "rescan-battle-slot") {
-      const s = battleRescanRef.current?.side;
-      if (s === "yours") setAppendLoadingSide("yours");
-      else if (s === "theirs") setAppendLoadingSide("theirs");
-      else setAppendLoadingSide(null);
-    } else {
-      setAppendLoadingSide(null);
-    }
-    try {
-      if (
-        (intent === "append-your-results" ||
-          intent === "append-your-trade") &&
-        mySideRef.current.length >= MAX_YOUR_CARDS
-      ) {
-        setError(
-          `You can keep up to ${MAX_YOUR_CARDS} cards on your side. Remove one to add another.`,
-        );
-        return;
-      }
-      if (
-        intent === "append-their-trade" &&
-        theirSideRef.current.length >= MAX_THEIR_CARDS
-      ) {
-        setError(
-          `You can keep up to ${MAX_THEIR_CARDS} cards on their side. Remove one to add another.`,
-        );
-        return;
-      }
-
-      const dataUrl = await prepareImageForScan(file);
-      const res = await fetch("/api/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: dataUrl }),
+  const runScan = useCallback(
+    async (file: File, team: BattleTeam, slot: number) => {
+      setError(null);
+      setSlotErrors((prev) => {
+        const next = { ...prev };
+        delete next[`${team}-${slot}`];
+        return next;
       });
-      const { ok, status, data } = await parseScanResponse(res);
-      if (!ok) {
-        throw new Error(
-          data.error ||
-            (status === 500
-              ? "Server error — check host logs and ANTHROPIC_API_KEY."
-              : `Scan failed (${status})`),
-        );
-      }
-      const rawPayload = data.recognitions ?? data.cards;
-      const recs = normalizeScanResults(rawPayload ?? []);
-      const lowCount = recs.filter((r) => r.confidence === "low").length;
-      setSkippedOnLastScan(lowCount);
-      const accepted = recs.filter((r) => r.confidence !== "low");
-
-      if (accepted.length === 0) {
-        if (intent === "replace-your-results") {
-          setLowConfidenceOpen(true);
-        } else if (intent === "append-your-results") {
-          setError(
-            "Could not read a card in that photo. Try again with one card in frame.",
-          );
-        } else {
-          setLowScanOverlay(true);
-        }
-        return;
-      }
-
-      const onePerPhoto = accepted.slice(0, 1);
-      const display = onePerPhoto.map(displayCardFromRecognition);
-      const toPrice = display.filter((d) => d.priceStatus === "loading");
-
-      if (intent === "replace-your-results") {
-        setMySide(display);
-        if (toPrice.length > 0) hydrateCardPrices(toPrice, setMySide);
-        setLowConfidenceOpen(false);
-        setMainTab("cards");
-      } else if (intent === "append-your-results") {
-        const row = display[0];
-        if (!row) {
+      setLoadingSlot({ team, slot });
+      try {
+        const dataUrl = await prepareImageForScan(file);
+        const res = await fetch("/api/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ imageBase64: dataUrl }),
+        });
+        const { ok, status, data } = await parseScanResponse(res);
+        if (!ok) {
           throw new Error(
-            "No card detected. Put one card in frame and try again.",
+            data.error ||
+              (status === 500
+                ? "Server error — check ANTHROPIC_API_KEY."
+                : `Scan failed (${status})`),
           );
         }
-        setMySide((prev) => [...prev, row]);
-        if (row.priceStatus === "loading") {
-          hydrateCardPrices([row], setMySide);
-        }
-      } else if (intent === "append-your-trade") {
-        const row = display[0];
-        if (!row) {
-          throw new Error(
-            "No card detected. Center one card and try again.",
-          );
-        }
-        setMySide((prev) => [...prev, row]);
-        if (row.priceStatus === "loading") {
-          hydrateCardPrices([row], setMySide);
-        }
-      } else if (intent === "append-their-trade") {
-        const row = display[0];
-        if (!row) {
-          throw new Error(
-            "No card detected. Center one card and try again.",
-          );
-        }
-        setTheirSide((prev) => [...prev, row]);
-        if (row.priceStatus === "loading") {
-          hydrateCardPrices([row], setTheirSide);
-        }
-      } else if (intent === "rescan-battle-slot") {
-        const slot = battleRescanRef.current;
-        const row = display[0];
-        if (!slot) {
-          throw new Error("Missing rescan slot — try again.");
-        }
-        if (!row) {
-          setError(
-            "Could not read a card in that photo. Try again with one card in frame.",
-          );
+        const rawPayload = data.recognitions ?? data.cards;
+        const recs = normalizeScanResults(rawPayload ?? []);
+        const accepted = recs.filter((r) => r.confidence !== "low");
+
+        if (accepted.length === 0) {
+          setLowScanOpen(true);
           return;
         }
-        const patch = (prev: DisplayCard[]) =>
-          prev.map((c, i) =>
-            i === slot.index
-              ? ({
-                  ...row,
-                  displayId: c.displayId,
-                } as DisplayCard)
-              : c,
-          );
-        if (slot.side === "yours") {
-          setMySide((prev) => {
-            const next = patch(prev);
-            const m = next[slot.index];
-            if (m?.priceStatus === "loading") {
-              hydrateCardPrices([m], setMySide);
-            }
-            return next;
-          });
-        } else {
-          setTheirSide((prev) => {
-            const next = patch(prev);
-            const m = next[slot.index];
-            if (m?.priceStatus === "loading") {
-              hydrateCardPrices([m], setTheirSide);
-            }
-            return next;
-          });
+
+        const raw = displayCardFromRecognition(accepted[0]);
+        const display: DisplayCard = { ...raw, priceStatus: "deferred" };
+
+        if (
+          display.recognitionConfidence === "high" &&
+          !cardPassesBattleValidation(display)
+        ) {
+          setSlotErrors((prev) => ({
+            ...prev,
+            [`${team}-${slot}`]:
+              "This card doesn't have enough battle data — try another card",
+          }));
+          return;
         }
+
+        const entry: RosterEntry = {
+          card: display,
+          scannedPhotoDataUrl: dataUrl,
+          record: { wins: 0, losses: 0 },
+        };
+        const setter = team === "blue" ? setBlueSetup : setGoldSetup;
+        setter((prev) => {
+          const roster = [...prev.roster];
+          roster[slot] = entry;
+          return { roster: roster.slice(0, MAX_SLOTS) };
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Something went wrong");
+      } finally {
+        setLoadingSlot(null);
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
-    } finally {
-      setLoading(false);
-      setAppendLoadingSide(null);
-      battleRescanRef.current = null;
-      setBattleRescanSlot(null);
-    }
-  }, []);
-
-  const onPickFile = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      e.target.value = "";
-      if (!file) return;
-      await runScan(file);
-    },
-    [runScan],
-  );
-
-  const openYourScan = useCallback(() => {
-    setError(null);
-    if (mySideRef.current.length >= MAX_YOUR_CARDS) {
-      setError(
-        `You already have ${MAX_YOUR_CARDS} cards. Remove one to scan another.`,
-      );
-      return;
-    }
-    scanIntentRef.current =
-      mySideRef.current.length === 0
-        ? "replace-your-results"
-        : "append-your-results";
-    scanInputRef.current?.click();
-  }, []);
-
-  const openAddYourFromResults = useCallback(() => {
-    setError(null);
-    if (mySideRef.current.length >= MAX_YOUR_CARDS) {
-      setError(
-        `You can keep up to ${MAX_YOUR_CARDS} cards. Remove one to add another.`,
-      );
-      return;
-    }
-    scanIntentRef.current = "append-your-results";
-    scanInputRef.current?.click();
-  }, []);
-
-  const openAddYourToTrade = useCallback(() => {
-    setError(null);
-    if (mySideRef.current.length >= MAX_YOUR_CARDS) {
-      setError(
-        `You can keep up to ${MAX_YOUR_CARDS} cards on your side. Remove one to add another.`,
-      );
-      return;
-    }
-    scanIntentRef.current = "append-your-trade";
-    scanInputRef.current?.click();
-  }, []);
-
-  const openAddTheirToTrade = useCallback(() => {
-    setError(null);
-    if (theirSideRef.current.length >= MAX_THEIR_CARDS) {
-      setError(
-        `You can keep up to ${MAX_THEIR_CARDS} cards on their side. Remove one to add another.`,
-      );
-      return;
-    }
-    scanIntentRef.current = "append-their-trade";
-    scanInputRef.current?.click();
-  }, []);
-
-  const openBattleRescan = useCallback(
-    (side: "yours" | "theirs", index: number) => {
-      setError(null);
-      battleRescanRef.current = { side, index };
-      setBattleRescanSlot({ side, index });
-      scanIntentRef.current = "rescan-battle-slot";
-      if (side === "yours") setAppendLoadingSide("yours");
-      else setAppendLoadingSide("theirs");
-      scanInputRef.current?.click();
     },
     [],
   );
 
-  const requestRemoveCard = (
-    side: "yours" | "theirs",
-    index: number,
-    name: string,
+  const openScan = (team: BattleTeam, slot: number) => {
+    setError(null);
+    scanTargetRef.current = { team, slot };
+    scanInputRef.current?.click();
+  };
+
+  const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const { team, slot } = scanTargetRef.current;
+    await runScan(file, team, slot);
+  };
+
+  const removeSlot = (team: BattleTeam, slot: number) => {
+    const setter = team === "blue" ? setBlueSetup : setGoldSetup;
+    setter((prev) => ({
+      roster: prev.roster.filter((_, i) => i !== slot),
+    }));
+    setSlotErrors((prev) => {
+      const next = { ...prev };
+      delete next[`${team}-${slot}`];
+      return next;
+    });
+  };
+
+  const confirmCard = (
+    team: BattleTeam,
+    slot: number,
+    displayId: string,
+    selected: ScannedCard,
   ) => {
-    setRemoveConfirm({ side, index, name });
-  };
-
-  const cancelRemoveCard = () => setRemoveConfirm(null);
-
-  const confirmRemoveCard = () => {
-    if (!removeConfirm) return;
-    const { side, index } = removeConfirm;
-    if (side === "yours") {
-      setMySide((prev) => prev.filter((_, i) => i !== index));
-    } else {
-      setTheirSide((prev) => prev.filter((_, i) => i !== index));
-    }
-    setRemoveConfirm(null);
-  };
-
-  const confirmYourCardIdentity = useCallback(
-    (displayId: string, selected: ScannedCard) => {
-      const toHydrate: DisplayCard = {
+    const setter = team === "blue" ? setBlueSetup : setGoldSetup;
+    setter((prev) => {
+      const entry = prev.roster[slot];
+      if (!entry || entry.card.displayId !== displayId) return prev;
+      const nextCard: DisplayCard = {
+        ...entry.card,
         ...selected,
-        displayId,
-        priceStatus: "loading",
-        recognitionConfidence: "medium",
+        displayId: entry.card.displayId,
         pendingConfirmation: false,
         alternates: [],
-        showGoldConfirmRing: true,
-      };
-      setMySide((prev) =>
-        prev.map((c) =>
-          c.displayId === displayId
-            ? {
-                ...c,
-                ...selected,
-                displayId: c.displayId,
-                priceStatus: "loading",
-                pendingConfirmation: false,
-                alternates: [],
-                showGoldConfirmRing: true,
-                recognitionConfidence: "medium",
-                imageUrl: undefined,
-                priceUsd: undefined,
-                trend: undefined,
-                trendPercent: undefined,
-                priceRange: undefined,
-              }
-            : c,
-        ),
-      );
-      hydrateCardPrices([toHydrate], setMySide);
-    },
-    [],
-  );
-
-  const confirmTheirCardIdentity = useCallback(
-    (displayId: string, selected: ScannedCard) => {
-      const toHydrate: DisplayCard = {
-        ...selected,
-        displayId,
-        priceStatus: "loading",
         recognitionConfidence: "medium",
-        pendingConfirmation: false,
-        alternates: [],
-        showGoldConfirmRing: true,
+        priceStatus: "deferred",
       };
-      setTheirSide((prev) =>
-        prev.map((c) =>
-          c.displayId === displayId
-            ? {
-                ...c,
-                ...selected,
-                displayId: c.displayId,
-                priceStatus: "loading",
-                pendingConfirmation: false,
-                alternates: [],
-                showGoldConfirmRing: true,
-                recognitionConfidence: "medium",
-                imageUrl: undefined,
-                priceUsd: undefined,
-                trend: undefined,
-                trendPercent: undefined,
-                priceRange: undefined,
-              }
-            : c,
-        ),
-      );
-      hydrateCardPrices([toHydrate], setTheirSide);
-    },
-    [],
-  );
+      if (!cardPassesBattleValidation(nextCard)) {
+        setSlotErrors((e) => ({
+          ...e,
+          [`${team}-${slot}`]:
+            "This card doesn't have enough battle data — try another card",
+        }));
+        return prev;
+      }
+      const roster = [...prev.roster];
+      roster[slot] = { ...entry, card: nextCard };
+      return { roster };
+    });
+  };
 
-  const notListedResultsRescan = useCallback(() => {
-    setMySide([]);
-    setMainTab("cards");
-  }, []);
+  const bothReady = teamIsReady(blueSetup) && teamIsReady(goldSetup);
+  const isLoading = loadingSlot !== null;
 
-  const notListedYourTradeRow = useCallback((displayId: string) => {
-    setMySide((prev) => prev.filter((c) => c.displayId !== displayId));
-    setError(null);
-    scanIntentRef.current = "append-your-trade";
-    scanInputRef.current?.click();
-  }, []);
+  const toRosterTuples = (setup: TeamSetup) =>
+    setup.roster.map(
+      (e) => [e.card, e.scannedPhotoDataUrl] as [DisplayCard, string | null],
+    );
 
-  const notListedTheirTradeRow = useCallback((displayId: string) => {
-    setTheirSide((prev) => prev.filter((c) => c.displayId !== displayId));
-    setError(null);
-    scanIntentRef.current = "append-their-trade";
-    scanInputRef.current?.click();
-  }, []);
+  const handleCheckRosters = (finalState: InteractiveBattleState) => {
+    const winner: BattleTeam =
+      finalState.status === "blue_wins" ? "blue" : "gold";
+    const updated = updateRecordsAfterBattle(
+      blueSetup.roster,
+      goldSetup.roster,
+      winner,
+    );
+    setBlueSetup({ roster: updated.blueRoster });
+    setGoldSetup({ roster: updated.goldRoster });
+    setLastBattleHp(extractHpFromBattle(finalState));
+    setInBattle(false);
+    setShowRosterReview(true);
+  };
 
-  const retryAppendAfterLow = useCallback(() => {
-    setLowScanOverlay(false);
-    setError(null);
-    if (lowAppendSideRef.current === "yours") {
-      scanIntentRef.current = "append-your-trade";
-      scanInputRef.current?.click();
-    } else if (lowAppendSideRef.current === "theirs") {
-      scanIntentRef.current = "append-their-trade";
-      scanInputRef.current?.click();
-    }
-  }, []);
+  const handleBattleAgain = () => {
+    setShowRosterReview(false);
+    setBattleKey((k) => k + 1);
+    setInBattle(true);
+  };
 
-  const yourTotal = sumPrices(mySide);
-  const theirTotal = sumPrices(theirSide);
-  const verdict = gradeFromDiff(yourTotal, theirTotal);
-  const absDiff = Math.abs(verdict.diff);
-  const summary = tradeSummary(verdict.favor, absDiff);
-  const trends = trendFlagLine(mySide, theirSide);
+  if (showRosterReview) {
+    return (
+      <RosterReviewScreen
+        blueRoster={blueSetup.roster}
+        goldRoster={goldSetup.roster}
+        hpByDisplayId={lastBattleHp}
+        onBlueRosterChange={(roster) => setBlueSetup({ roster })}
+        onGoldRosterChange={(roster) => setGoldSetup({ roster })}
+        onReady={handleBattleAgain}
+      />
+    );
+  }
 
-  const yourListAddLoading = loading && appendLoadingSide === "yours";
-  const theirListAddLoading = loading && appendLoadingSide === "theirs";
+  if (inBattle && bothReady) {
+    return (
+      <InteractiveBattleScreen
+        key={battleKey}
+        blueRoster={toRosterTuples(blueSetup)}
+        goldRoster={toRosterTuples(goldSetup)}
+        onCheckRosters={handleCheckRosters}
+      />
+    );
+  }
 
   return (
-    <div className="mx-auto flex min-h-dvh max-w-md flex-col">
+    <div className="mx-auto flex min-h-dvh max-w-4xl flex-col bg-[#0f0f13] text-white">
       <input
         ref={scanInputRef}
         type="file"
@@ -508,575 +335,385 @@ export default function Home() {
         onChange={onPickFile}
       />
 
-      <RemoveCardModal
-        open={removeConfirm !== null}
-        pokemonName={removeConfirm?.name ?? ""}
-        onKeep={cancelRemoveCard}
-        onRemove={confirmRemoveCard}
-      />
-
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 pb-28 pt-[max(1rem,env(safe-area-inset-top))]">
-        {lowConfidenceOpen ? (
-          <LowConfidenceView
-            onTryAgain={() => {
-              setSkippedOnLastScan(0);
-              setLowConfidenceOpen(false);
-            }}
-          />
-        ) : (
-          <>
-            {mainTab === "cards" &&
-              (mySide.length === 0 ? (
-                <ScannerView
-                  mySideCount={mySide.length}
-                  maxCards={MAX_YOUR_CARDS}
-                  loading={loading}
-                  error={error}
-                  onScan={openYourScan}
-                />
-              ) : (
-                <ResultsView
-                  cards={mySide}
-                  cardCount={mySide.length}
-                  maxCards={MAX_YOUR_CARDS}
-                  total={yourTotal}
-                  loading={loading}
-                  yourAddLoading={yourListAddLoading}
-                  error={error}
-                  skippedOnLastScan={skippedOnLastScan}
-                  onConfirmIdentity={confirmYourCardIdentity}
-                  onNotListed={notListedResultsRescan}
-                  onAddYourCard={openAddYourFromResults}
-                  onRequestRemoveCard={(index, name) =>
-                    requestRemoveCard("yours", index, name)
-                  }
-                  onScanAgain={openYourScan}
-                />
-              ))}
-
-            {mainTab === "trade" && (
-              <TradeView
-                mySide={mySide}
-                theirSide={theirSide}
-                maxYourCards={MAX_YOUR_CARDS}
-                maxTheirCards={MAX_THEIR_CARDS}
-                yourTotal={yourTotal}
-                theirTotal={theirTotal}
-                verdict={verdict}
-                absDiff={absDiff}
-                summary={summary}
-                trends={trends}
-                loading={loading}
-                yourAddLoading={yourListAddLoading}
-                theirAddLoading={theirListAddLoading}
-                error={error}
-                onAddYourCard={openAddYourToTrade}
-                onAddTheirCard={openAddTheirToTrade}
-                onRequestRemoveCard={requestRemoveCard}
-                onConfirmYour={confirmYourCardIdentity}
-                onConfirmTheir={confirmTheirCardIdentity}
-                onNotListedYour={notListedYourTradeRow}
-                onNotListedTheir={notListedTheirTradeRow}
-              />
-            )}
-
-            {mainTab === "battle" && (
-              <BattleScreen
-                mySide={mySide}
-                theirSide={theirSide}
-                maxMy={MAX_YOUR_CARDS}
-                maxTheir={MAX_THEIR_CARDS}
-                loading={loading}
-                myAddLoading={yourListAddLoading}
-                theirAddLoading={theirListAddLoading}
-                error={error}
-                onScanMy={openAddYourToTrade}
-                onScanTheir={openAddTheirToTrade}
-                onRequestRemove={requestRemoveCard}
-                battleRescanSlot={battleRescanSlot}
-                onRescanBattleSlot={openBattleRescan}
-                onGoToMyCards={() => {
-                  setError(null);
-                  setMainTab("cards");
-                }}
-              />
-            )}
-          </>
-        )}
-      </div>
-
-      {!lowConfidenceOpen && (
-        <BottomTabNav
-          active={mainTab}
-          onChange={(t) => {
-            setError(null);
-            setMainTab(t);
+      {lowScanOpen && (
+        <LowScanOverlay
+          onDismiss={() => setLowScanOpen(false)}
+          onRetry={() => {
+            setLowScanOpen(false);
+            const { team, slot } = scanTargetRef.current;
+            openScan(team, slot);
           }}
         />
       )}
 
-      {lowScanOverlay && (
-        <LowConfidenceAppendOverlay
-          onTryAgain={retryAppendAfterLow}
-          onDismiss={() => setLowScanOverlay(false)}
+      <header className="shrink-0 px-4 pb-3 pt-[max(1rem,env(safe-area-inset-top))] text-center">
+        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
+          PokéScan
+        </span>
+        <p className="mt-1 text-sm text-zinc-500">
+          Photograph each Pokémon card — AI reads HP, type &amp; attacks from your
+          photo. Super-effective hits use type matchups, not the card footer.
+        </p>
+      </header>
+
+      <div className="flex shrink-0 gap-2 px-4 pb-3 md:hidden">
+        <SetupTeamTab
+          label="Blue"
+          color="#3B82F6"
+          active={setupTab === "blue"}
+          ready={teamIsReady(blueSetup)}
+          onClick={() => setSetupTab("blue")}
         />
-      )}
+        <SetupTeamTab
+          label="Gold"
+          color="#F59E0B"
+          active={setupTab === "gold"}
+          ready={teamIsReady(goldSetup)}
+          onClick={() => setSetupTab("gold")}
+        />
+      </div>
+
+      <main className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 pb-4">
+        <div className="hidden flex-col gap-4 md:flex md:flex-row">
+          <TeamPanel
+            label="BLUE TEAM"
+            color="#3B82F6"
+            setup={blueSetup}
+            loadingSlot={loadingSlot?.team === "blue" ? loadingSlot.slot : null}
+            slotErrors={slotErrors}
+            onScan={openScan}
+            onRemove={removeSlot}
+            onConfirm={confirmCard}
+          />
+          <TeamPanel
+            label="GOLD TEAM"
+            color="#F59E0B"
+            setup={goldSetup}
+            loadingSlot={loadingSlot?.team === "gold" ? loadingSlot.slot : null}
+            slotErrors={slotErrors}
+            onScan={openScan}
+            onRemove={removeSlot}
+            onConfirm={confirmCard}
+          />
+        </div>
+        <div className="md:hidden">
+          {setupTab === "blue" ? (
+            <TeamPanel
+              label="BLUE TEAM"
+              color="#3B82F6"
+              setup={blueSetup}
+              loadingSlot={loadingSlot?.team === "blue" ? loadingSlot.slot : null}
+              slotErrors={slotErrors}
+              onScan={openScan}
+              onRemove={removeSlot}
+              onConfirm={confirmCard}
+            />
+          ) : (
+            <TeamPanel
+              label="GOLD TEAM"
+              color="#F59E0B"
+              setup={goldSetup}
+              loadingSlot={loadingSlot?.team === "gold" ? loadingSlot.slot : null}
+              slotErrors={slotErrors}
+              onScan={openScan}
+              onRemove={removeSlot}
+              onConfirm={confirmCard}
+            />
+          )}
+        </div>
+      </main>
+
+      <footer className="ps-sticky-footer px-4">
+        {error && (
+          <p className="mb-2 text-center text-sm text-red-400" role="alert">
+            {error}
+          </p>
+        )}
+        <button
+          type="button"
+          disabled={!bothReady || isLoading}
+          onClick={() => {
+            setError(null);
+            setInBattle(true);
+          }}
+          className="ps-btn ps-touch w-full rounded-full bg-[#DC2626] py-4 text-lg font-bold text-white shadow-[0_8px_30px_rgba(220,38,38,0.25)] active:scale-[0.99] disabled:pointer-events-none disabled:opacity-40"
+        >
+          ⚔ BATTLE
+        </button>
+      </footer>
     </div>
   );
 }
 
-function BottomTabNav({
+const SLOT_LABELS = ["Active", "Bench 1", "Bench 2"] as const;
+
+function SetupTeamTab({
+  label,
+  color,
   active,
-  onChange,
+  ready,
+  onClick,
 }: {
-  active: MainTab;
-  onChange: (t: MainTab) => void;
+  label: string;
+  color: string;
+  active: boolean;
+  ready: boolean;
+  onClick: () => void;
 }) {
-  const btn = (t: MainTab, label: string, activeClass: string) => (
+  return (
     <button
       type="button"
-      onClick={() => onChange(t)}
-      className={`flex-1 py-3.5 text-center text-xs font-semibold tracking-wide transition ${
-        active === t ? activeClass : "text-zinc-500 hover:text-zinc-300"
+      onClick={onClick}
+      className={`ps-touch ps-btn flex-1 rounded-xl py-3 text-sm font-bold transition ${
+        active ? "text-white ring-2" : "bg-white/[0.04] text-zinc-400 ring-1 ring-white/10"
       }`}
+      style={
+        active
+          ? { backgroundColor: `${color}33`, borderColor: color, boxShadow: `0 0 20px ${color}33` }
+          : undefined
+      }
     >
       {label}
+      {ready ? " ✓" : ""}
     </button>
   );
-
-  return (
-    <nav className="fixed bottom-0 left-0 right-0 z-30 border-t border-white/10 bg-[#0f0f13]/95 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1 backdrop-blur-md">
-      <div className="mx-auto flex max-w-md px-1">
-        {btn("cards", "My Cards", "text-[#F5C518]")}
-        {btn("trade", "Trade", "text-[#F5C518]")}
-        {btn("battle", "Battle", "text-[#DC2626]")}
-      </div>
-    </nav>
-  );
 }
 
-function LowConfidenceView({ onTryAgain }: { onTryAgain: () => void }) {
-  return (
-    <>
-      <header className="mb-6 flex items-center justify-between">
-        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
-          PokeBlock
-        </span>
-      </header>
-      <div className="flex flex-1 flex-col px-1">
-        <h1 className="text-center text-xl font-semibold leading-snug text-white">
-          Couldn&apos;t read this card clearly
-        </h1>
-        <ul className="mx-auto mt-8 max-w-sm list-disc space-y-3 pl-5 text-sm leading-relaxed text-zinc-400">
-          <li>Photo one card at a time — fill the frame with that card</li>
-          <li>Make sure the card number (bottom right) is visible</li>
-          <li>Try better lighting — avoid glare</li>
-          <li>Hold the camera steady</li>
-        </ul>
-        <button
-          type="button"
-          onClick={onTryAgain}
-          className="mt-auto w-full rounded-full bg-[#F5C518] py-3.5 text-sm font-semibold text-[#0f0f13]"
-        >
-          Try again
-        </button>
-      </div>
-    </>
-  );
-}
-
-function LowConfidenceAppendOverlay({
-  onTryAgain,
-  onDismiss,
+function TeamPanel({
+  label,
+  color,
+  setup,
+  loadingSlot,
+  slotErrors,
+  onScan,
+  onRemove,
+  onConfirm,
 }: {
-  onTryAgain: () => void;
+  label: string;
+  color: string;
+  setup: TeamSetup;
+  loadingSlot: number | null;
+  slotErrors: Record<string, string>;
+  onScan: (team: BattleTeam, slot: number) => void;
+  onRemove: (team: BattleTeam, slot: number) => void;
+  onConfirm: (
+    team: BattleTeam,
+    slot: number,
+    displayId: string,
+    selected: ScannedCard,
+  ) => void;
+}) {
+  const team: BattleTeam = label.startsWith("BLUE") ? "blue" : "gold";
+  const hasActive = setup.roster.length > 0;
+  const visibleSlots = hasActive
+    ? Math.min(MAX_SLOTS, setup.roster.length + (setup.roster.length < MAX_SLOTS ? 1 : 0))
+    : 1;
+
+  const glowStyle = {
+    boxShadow: `0 0 32px ${color}22`,
+    borderColor: `${color}55`,
+  };
+
+  return (
+    <section
+      className="flex flex-1 flex-col gap-3 rounded-2xl border bg-white/[0.03] p-4"
+      style={glowStyle}
+    >
+      <h2
+        className="text-center text-sm font-bold tracking-widest"
+        style={{ color }}
+      >
+        {label}
+      </h2>
+      {Array.from({ length: visibleSlots }, (_, slot) => {
+        const entry = setup.roster[slot];
+        const slotLabel = SLOT_LABELS[slot];
+        const err = slotErrors[`${team}-${slot}`];
+        const loading = loadingSlot === slot;
+
+        if (!entry) {
+          return (
+            <button
+              key={slot}
+              type="button"
+              onClick={() => onScan(team, slot)}
+              disabled={loading}
+              className="ps-touch flex min-h-[11rem] flex-col items-center justify-center rounded-xl border-2 border-dashed border-white/20 bg-white/[0.02] active:bg-white/[0.04] disabled:pointer-events-none disabled:opacity-60"
+            >
+              {loading ? (
+                <ScanProgressBar
+                  accentColor={color}
+                  className="w-full max-w-[10.5rem] px-3"
+                />
+              ) : (
+                <>
+                  <span className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+                    {slotLabel}
+                  </span>
+                  <CameraGlyph className="mb-2 h-8 w-8 text-zinc-500" />
+                  <span className="text-xs text-zinc-500">Scan card</span>
+                </>
+              )}
+            </button>
+          );
+        }
+
+        const pending =
+          entry.card.pendingConfirmation &&
+          entry.card.recognitionConfidence === "medium";
+
+        if (pending) {
+          return (
+            <ScanLoadingOverlay
+              key={slot}
+              active={loading}
+              accentColor={color}
+              className="rounded-xl"
+            >
+              <div className="rounded-xl ring-1 ring-yellow-500/30">
+                <p className="bg-yellow-500/10 px-2 py-1 text-center text-[10px] font-medium text-yellow-200">
+                  {slotLabel} — Is this right?
+                </p>
+                <MediumConfirmPanel
+                  card={entry.card}
+                  onConfirm={(id, sel) => onConfirm(team, slot, id, sel)}
+                  onRescan={() => onScan(team, slot)}
+                  onRemove={() => onRemove(team, slot)}
+                />
+              </div>
+            </ScanLoadingOverlay>
+          );
+        }
+
+        return (
+          <ScanLoadingOverlay
+            key={slot}
+            active={loading}
+            accentColor={color}
+            className="rounded-xl"
+          >
+          <div className="relative rounded-xl bg-white/[0.02] p-2 ring-1 ring-white/10">
+            <span className="mb-1 block text-center text-[10px] font-semibold uppercase tracking-wide text-zinc-600">
+              {slotLabel}
+            </span>
+            <button
+              type="button"
+              onClick={() => onRemove(team, slot)}
+              className="ps-touch absolute right-1 top-1 z-10 flex h-11 w-11 items-center justify-center rounded-full bg-black/70 text-lg text-zinc-200 active:bg-black/90"
+              aria-label="Remove"
+            >
+              ×
+            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={entry.scannedPhotoDataUrl ?? ""}
+              alt={entry.card.name}
+              className="mx-auto mb-2 aspect-[63/88] w-28 max-w-full rounded-lg object-contain sm:w-24"
+            />
+            <p className="text-center text-sm font-semibold text-white">
+              {entry.card.name}
+            </p>
+            <p className="text-center text-xs text-zinc-500">{entry.card.type}</p>
+            <p className="text-center text-sm font-medium" style={{ color }}>
+              {entry.card.battleHp} HP
+            </p>
+            {err && (
+              <p className="mt-1 text-center text-[10px] text-red-400">{err}</p>
+            )}
+          </div>
+          </ScanLoadingOverlay>
+        );
+      })}
+    </section>
+  );
+}
+
+function MediumConfirmPanel({
+  card,
+  onConfirm,
+  onRescan,
+  onRemove,
+}: {
+  card: DisplayCard;
+  onConfirm: (displayId: string, selected: ScannedCard) => void;
+  onRescan: () => void;
+  onRemove: () => void;
+}) {
+  const primary = scannedFieldsFromDisplayLike(card);
+  return (
+    <div className="space-y-2 p-3">
+      <p className="text-center text-sm font-semibold text-white">{card.name}</p>
+      <button
+        type="button"
+        onClick={() => onConfirm(card.displayId, primary)}
+        className="ps-btn ps-touch w-full rounded-lg bg-[#F5C518]/15 px-3 py-3 text-sm font-medium text-[#F5C518] ring-1 ring-[#F5C518]/40"
+      >
+        Yes — use this match
+      </button>
+      {card.alternates.map((alt, i) => (
+        <button
+          key={`${alt.number}-${i}`}
+          type="button"
+          onClick={() => onConfirm(card.displayId, alt)}
+          className="w-full rounded-lg bg-white/5 px-3 py-2 text-xs text-white ring-1 ring-white/10"
+        >
+          {alt.name} · #{alt.number}
+        </button>
+      ))}
+      <button
+        type="button"
+        onClick={onRescan}
+        className="w-full text-center text-xs text-zinc-500 underline"
+      >
+        Rescan
+      </button>
+      <button
+        type="button"
+        onClick={onRemove}
+        className="w-full text-center text-xs text-zinc-600"
+      >
+        Cancel
+      </button>
+    </div>
+  );
+}
+
+function LowScanOverlay({
+  onDismiss,
+  onRetry,
+}: {
   onDismiss: () => void;
+  onRetry: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-40 flex items-end justify-center bg-black/80 p-4 sm:items-center">
-      <div
-        role="dialog"
-        aria-modal="true"
-        className="w-full max-w-sm rounded-2xl bg-[#18181f] p-5 shadow-2xl ring-1 ring-white/10"
-      >
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 p-4">
+      <div className="w-full max-w-sm rounded-2xl bg-[#18181f] p-5 ring-1 ring-white/10">
         <h2 className="text-lg font-semibold text-white">
           Couldn&apos;t read this card clearly
         </h2>
         <ul className="mt-4 list-disc space-y-2 pl-5 text-sm text-zinc-400">
-          <li>One card in the photo — avoid extra cards in frame</li>
-          <li>Make sure the card number (bottom right) is visible</li>
+          <li>One card in the photo — fill the frame</li>
+          <li>Make sure the card number is visible</li>
           <li>Try better lighting — avoid glare</li>
-          <li>Hold the camera steady and fill the frame</li>
         </ul>
-        <div className="mt-6 flex flex-col gap-2 sm:flex-row-reverse">
+        <div className="mt-6 flex flex-col gap-2">
           <button
             type="button"
-            onClick={onTryAgain}
-            className="w-full rounded-full bg-[#F5C518] py-3 text-sm font-semibold text-[#0f0f13] sm:flex-1"
+            onClick={onRetry}
+            className="w-full rounded-full bg-[#F5C518] py-3 text-sm font-semibold text-[#0f0f13]"
           >
             Try again
           </button>
           <button
             type="button"
             onClick={onDismiss}
-            className="w-full rounded-full bg-white/10 py-3 text-sm font-semibold text-white ring-1 ring-white/15 sm:flex-1"
+            className="w-full rounded-full bg-white/10 py-3 text-sm font-semibold text-white"
           >
             Cancel
           </button>
         </div>
       </div>
     </div>
-  );
-}
-
-function ScannerView({
-  mySideCount,
-  maxCards,
-  loading,
-  error,
-  onScan,
-}: {
-  mySideCount: number;
-  maxCards: number;
-  loading: boolean;
-  error: string | null;
-  onScan: () => void;
-}) {
-  const atCap = mySideCount >= maxCards;
-  return (
-    <>
-      <header className="mb-6 flex items-center justify-between">
-        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
-          PokeBlock
-        </span>
-      </header>
-
-      <button
-        type="button"
-        onClick={onScan}
-        disabled={loading || atCap}
-        className="flex flex-1 flex-col items-stretch rounded-2xl text-left disabled:opacity-60"
-      >
-        <div className="flex min-h-[min(52vh,420px)] flex-1 flex-col items-center justify-center rounded-2xl border-2 border-dashed border-[#F5C518]/70 bg-white/[0.03] px-6 py-10 ring-1 ring-[#F5C518]/15">
-          <CameraGlyph className="mb-4 h-14 w-14 text-[#F5C518]/90" />
-          <p className="text-center text-sm leading-relaxed text-zinc-400">
-            One card in frame · tap to scan
-          </p>
-          <p className="mt-2 text-center text-xs text-zinc-600">
-            Photo one card at a time. You can keep up to {maxCards} cards.
-          </p>
-        </div>
-      </button>
-
-      <div className="mt-6 space-y-3">
-        <button
-          type="button"
-          onClick={onScan}
-          disabled={loading || atCap}
-          className="w-full rounded-full bg-[#F5C518] py-3.5 text-center text-sm font-semibold text-[#0f0f13] shadow-[0_8px_30px_rgba(245,197,24,0.18)] transition active:scale-[0.99] disabled:pointer-events-none disabled:opacity-50"
-        >
-          {loading
-            ? "Reading your card..."
-            : atCap
-              ? `${maxCards} cards — remove one to scan`
-              : "Scan a card"}
-        </button>
-        {loading && (
-          <p className="text-center text-sm text-zinc-500">
-            Reading your card...
-          </p>
-        )}
-        {error && (
-          <p className="text-center text-sm text-red-400" role="alert">
-            {error}
-          </p>
-        )}
-      </div>
-    </>
-  );
-}
-
-function ResultsView({
-  cards,
-  cardCount,
-  maxCards,
-  total,
-  loading,
-  yourAddLoading,
-  error,
-  skippedOnLastScan,
-  onConfirmIdentity,
-  onNotListed,
-  onAddYourCard,
-  onRequestRemoveCard,
-  onScanAgain,
-}: {
-  cards: DisplayCard[];
-  cardCount: number;
-  maxCards: number;
-  total: number;
-  loading: boolean;
-  yourAddLoading: boolean;
-  error: string | null;
-  skippedOnLastScan: number;
-  onConfirmIdentity: (displayId: string, selected: ScannedCard) => void;
-  onNotListed: () => void;
-  onAddYourCard: () => void;
-  onRequestRemoveCard: (index: number, name: string) => void;
-  onScanAgain: () => void;
-}) {
-  const showAddTile = cardCount >= 1 && cardCount < maxCards;
-  const atCap = cardCount >= maxCards;
-
-  return (
-    <>
-      <header className="mb-5 flex items-center justify-between">
-        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
-          PokeBlock
-        </span>
-      </header>
-
-      <h1 className="mb-1 text-2xl font-semibold tracking-tight text-white">
-        Your Cards
-      </h1>
-      <p className="mb-4 text-xs text-zinc-500">
-        One card per photo · up to {maxCards} cards · use the bar below for
-        Trade or Battle — your list stays in sync everywhere.
-      </p>
-
-      {skippedOnLastScan > 0 ? (
-        <p className="mb-3 text-xs text-zinc-500">
-          Couldn&apos;t read {skippedOnLastScan} card
-          {skippedOnLastScan === 1 ? "" : "s"} in that photo (too uncertain).
-        </p>
-      ) : null}
-
-      <div className="flex flex-1 items-start gap-3">
-        <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
-          {cards.length === 0 && !loading && (
-            <p className="text-sm text-zinc-500">
-              No card detected. Try one card in frame with less glare.
-            </p>
-          )}
-          {cards.map((c, i) => (
-            <ScanResultCard
-              key={c.displayId}
-              card={c}
-              showRemove
-              onRemoveClick={() => onRequestRemoveCard(i, c.name)}
-              onConfirmIdentity={onConfirmIdentity}
-              onNotListed={onNotListed}
-            />
-          ))}
-        </div>
-        {showAddTile ? (
-          <AddCardTile
-            onClick={onAddYourCard}
-            disabled={loading || atCap}
-            loading={yourAddLoading}
-          />
-        ) : null}
-      </div>
-
-      {error && (
-        <p className="mt-3 text-sm text-red-400" role="alert">
-          {error}
-        </p>
-      )}
-
-      <div className="mt-auto pt-8">
-        <p className="mb-3 text-center text-sm text-zinc-500">
-          {cardCount} of {maxCards} card{cardCount === 1 ? "" : "s"} ·{" "}
-          <span className="font-medium text-white">${total}</span>
-          {hasPriceLoading(cards) ? (
-            <span className="text-zinc-600"> · …</span>
-          ) : null}
-        </p>
-        <button
-          type="button"
-          onClick={onScanAgain}
-          disabled={loading || atCap}
-          className="w-full rounded-full py-2 text-center text-xs text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline disabled:opacity-40"
-        >
-          {atCap
-            ? `${maxCards} cards — remove one to scan again`
-            : "Scan another card"}
-        </button>
-      </div>
-    </>
-  );
-}
-
-function TradeView({
-  mySide,
-  theirSide,
-  maxYourCards,
-  maxTheirCards,
-  yourTotal,
-  theirTotal,
-  verdict,
-  absDiff,
-  summary,
-  trends,
-  loading,
-  yourAddLoading,
-  theirAddLoading,
-  error,
-  onAddYourCard,
-  onAddTheirCard,
-  onRequestRemoveCard,
-  onConfirmYour,
-  onConfirmTheir,
-  onNotListedYour,
-  onNotListedTheir,
-}: {
-  mySide: DisplayCard[];
-  theirSide: DisplayCard[];
-  maxYourCards: number;
-  maxTheirCards: number;
-  yourTotal: number;
-  theirTotal: number;
-  verdict: ReturnType<typeof gradeFromDiff>;
-  absDiff: number;
-  summary: string;
-  trends: string;
-  loading: boolean;
-  yourAddLoading: boolean;
-  theirAddLoading: boolean;
-  error: string | null;
-  onAddYourCard: () => void;
-  onAddTheirCard: () => void;
-  onRequestRemoveCard: (
-    side: "yours" | "theirs",
-    index: number,
-    name: string,
-  ) => void;
-  onConfirmYour: (displayId: string, selected: ScannedCard) => void;
-  onConfirmTheir: (displayId: string, selected: ScannedCard) => void;
-  onNotListedYour: (displayId: string) => void;
-  onNotListedTheir: (displayId: string) => void;
-}) {
-  const diffLabel =
-    verdict.favor === "even"
-      ? "Even trade"
-      : verdict.favor === "yours"
-        ? `+$${absDiff} in your favor`
-        : `-$${absDiff}`;
-
-  return (
-    <>
-      <header className="mb-5 flex items-center justify-between">
-        <span className="text-xl font-bold tracking-tight text-[#F5C518]">
-          PokeBlock
-        </span>
-        <span className="text-sm font-semibold text-zinc-400">Trade</span>
-      </header>
-
-      <section className="mb-8">
-        <h2 className="mb-1 text-lg font-semibold text-white">Your Cards</h2>
-        <p className="mb-3 text-xs text-zinc-600">
-          One card per photo · up to {maxYourCards} cards · same list as on the
-          home results screen and in Battle Mode.
-        </p>
-        <div className="flex items-start gap-3">
-          <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
-            {mySide.length === 0 && !yourAddLoading && (
-              <p className="text-xs text-zinc-600">
-                Add your cards one at a time (max {maxYourCards}).
-              </p>
-            )}
-            {mySide.map((c, i) => (
-              <ScanResultCard
-                key={c.displayId}
-                card={c}
-                showRemove
-                onRemoveClick={() =>
-                  onRequestRemoveCard("yours", i, c.name)
-                }
-                onConfirmIdentity={onConfirmYour}
-                onNotListed={() => onNotListedYour(c.displayId)}
-              />
-            ))}
-          </div>
-          <AddCardTile
-            onClick={onAddYourCard}
-            disabled={loading || mySide.length >= maxYourCards}
-            loading={yourAddLoading}
-          />
-        </div>
-        <p className="mt-2 text-right text-xs text-zinc-500">
-          {mySide.length} of {maxYourCards} · Subtotal · ${yourTotal}
-          {hasPriceLoading(mySide) ? " · …" : ""}
-        </p>
-      </section>
-
-      <section className="mb-6">
-        <h2 className="mb-1 text-lg font-semibold text-white">Their Cards</h2>
-        <p className="mb-3 text-xs text-zinc-600">
-          One card per photo · up to {maxTheirCards} cards on their side.
-        </p>
-        <div className="flex items-start gap-3">
-          <div className="flex min-h-[4.5rem] min-w-0 flex-1 flex-col gap-3">
-            {theirSide.length === 0 && !theirAddLoading && (
-              <p className="text-xs text-zinc-600">
-                Scan their cards one at a time (max {maxTheirCards}).
-              </p>
-            )}
-            {theirSide.map((c, i) => (
-              <ScanResultCard
-                key={c.displayId}
-                card={c}
-                showRemove
-                onRemoveClick={() =>
-                  onRequestRemoveCard("theirs", i, c.name)
-                }
-                onConfirmIdentity={onConfirmTheir}
-                onNotListed={() => onNotListedTheir(c.displayId)}
-              />
-            ))}
-          </div>
-          <AddCardTile
-            onClick={onAddTheirCard}
-            disabled={loading || theirSide.length >= maxTheirCards}
-            loading={theirAddLoading}
-          />
-        </div>
-        <p className="mt-2 text-right text-xs text-zinc-500">
-          {theirSide.length} of {maxTheirCards} · Subtotal · ${theirTotal}
-          {hasPriceLoading(theirSide) ? " · …" : ""}
-        </p>
-      </section>
-
-      {error && (
-        <p className="mb-4 text-sm text-red-400" role="alert">
-          {error}
-        </p>
-      )}
-
-      <div className="mt-auto space-y-3 rounded-2xl bg-white/[0.05] p-4 ring-1 ring-white/[0.08]">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
-              Trade grade
-            </p>
-            <p className="text-4xl font-bold text-[#F5C518]">{verdict.grade}</p>
-          </div>
-          <p
-            className={
-              verdict.favor === "theirs"
-                ? "text-right text-sm font-semibold text-red-400"
-                : verdict.favor === "yours"
-                  ? "text-right text-sm font-semibold text-[#00E5A0]"
-                  : "text-right text-sm font-semibold text-zinc-300"
-            }
-          >
-            {diffLabel}
-          </p>
-        </div>
-        <p className="text-sm leading-relaxed text-zinc-400">{summary}</p>
-        <p className="text-xs leading-relaxed text-[#00E5A0]">{trends}</p>
-      </div>
-    </>
   );
 }
 
