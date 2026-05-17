@@ -348,7 +348,7 @@ export default function Home() {
 
       <header className="shrink-0 px-4 pb-3 pt-[max(1rem,env(safe-area-inset-top))] text-center">
         <span className="text-xl font-bold tracking-tight text-[#F5C518]">
-          PokéScan
+          PokeBlock
         </span>
         <p className="mt-1 text-sm text-zinc-500">
           Photograph each Pokémon card — AI reads HP, type &amp; attacks from your
